@@ -1,96 +1,137 @@
 # src/data_ingestion/document_parser.py
 
 import os
-from typing import List
-from unstructured.partition.auto import partition # Função universal do unstructured
-from unstructured.documents.elements import Element
+import re
+from typing import List, Dict, Any, Tuple
+from unstructured.partition.auto import partition
+from unstructured.documents.elements import Element, Title # Importar Title para identificar títulos
 
-def extract_text_from_file_unstructured(file_path: str) -> str:
+def extract_text_from_file_unstructured(file_path: str) -> Tuple[str, Dict[str, Any]]:
     """
-    Extrai o texto de qualquer tipo de arquivo suportado usando a biblioteca unstructured.
-    A função partition do unstructured tenta extrair elementos de texto, tabelas, etc.
-    Para esta PoC, concatenamos o texto de todos os elementos.
+    Extrai o texto de qualquer tipo de arquivo suportado usando a biblioteca unstructured
+    e também tenta extrair metadados estruturados do CONTEÚDO do documento,
+    focando na seção "AMBIENTAÇÃO".
+
+    Retorna uma tupla: (texto_completo, dicionario_de_metadados_do_conteudo)
     """
     if not os.path.exists(file_path):
         print(f"Erro: Arquivo não encontrado - {file_path}")
-        return ""
+        return "", {}
+
+    content_specific_metadata = {} # Dicionário para armazenar metadados do conteúdo
 
     try:
-        # A função partition detecta automaticamente o tipo de arquivo e aplica o processamento adequado.
-        # Estamos passando o file_path, e unstructured cuidará da leitura.
-        elements: List[Element] = partition(filename=file_path)
+        # Adicionado 'languages=["por"]' para indicar o idioma, suprimindo o warning
+        elements: List[Element] = partition(filename=file_path, languages=["por"])
 
-        # Concatena o texto de todos os elementos extraídos.
-        # Elementos de tabela podem ser processados de forma mais sofisticada depois,
-        # mas para começar, ter o texto é o suficiente.
+        # --- LÓGICA PARA EXTRAIR METADADOS DO CONTEÚDO (Ex: seção AMBIENTAÇÃO) ---
+        ambientacao_elements_text = []
+        found_ambientacao_title = False
+        
+        # 1. Coletar todo o texto da seção AMBIENTAÇÃO
+        for el in elements:
+            # Verifica se encontramos o título "AMBIENTAÇÃO" (case-insensitive)
+            if isinstance(el, Title) and el.text.strip().upper() == "AMBIENTAÇÃO":
+                found_ambientacao_title = True
+                continue # Pula o próprio título "AMBIENTAÇÃO"
+
+            if found_ambientacao_title:
+                # Heurística para parar de coletar quando a seção AMBIENTAÇÃO termina
+                # Verifica se o elemento atual é outro Título principal conhecido
+                # ou uma quebra de página (PageBreak).
+                # Usamos uma lista mais completa de títulos que podem encerrar a seção
+                ending_titles = ["HISTÓRICO DE REVISÕES", "SUMÁRIO", "OBJETIVO", "1. DEFINIÇÃO DE ESCOPO TÉCNICO", "ASSINATURA E ACEITE", "2. PREMISSAS DO ESCOPO TÉCNICO E DE NEGÓCIO"]
+                if isinstance(el, Title) and el.text.strip().upper() in ending_titles:
+                    break # Parar de coletar dados da Ambientação
+                if el.category == "PageBreak":
+                    break
+
+                if el.text and el.text.strip():
+                    ambientacao_elements_text.append(el.text.strip())
+        
+        # Combinar os textos coletados da Ambientação em um único bloco para parsing
+        # Usamos espaço como separador, pois o unstructured pode ter concatenado tudo.
+        ambientacao_full_block_text = " ".join(ambientacao_elements_text)
+
+        # 2. Processar o bloco de texto para extrair pares chave-valor
+        if ambientacao_full_block_text:
+            # Mapeamento das chaves do documento para nomes de metadados padronizados
+            known_keys_map = {
+                "Nome do cliente": "client_name",
+                "Código de cliente": "client_code",
+                "Nome do projeto": "project_name_full",
+                "Código do projeto": "project_code_crm",
+                "Segmento cliente": "client_segment",
+                "Unidade TOTVS": "totvs_unit",
+                "Data Projeto": "project_date",
+                "Proposta comercial": "commercial_proposal",
+                "Gerente/Coordenador TOTVS": "totvs_coordinator",
+                "Gerente/Coordenador cliente": "client_coordinator"
+            }
+            
+            # Ordenar as chaves conhecidas por comprimento (maior primeiro)
+            # Isso evita que "Nome do cliente" seja encontrado antes de "Nome do cliente longo e complexo"
+            sorted_keys = sorted(known_keys_map.keys(), key=len, reverse=True)
+            
+            # Construir uma regex para encontrar qualquer uma das chaves conhecidas
+            # seguida por um dois pontos e um espaço (ex: "Chave: ")
+            key_regex_pattern = r'(' + '|'.join(re.escape(k) for k in sorted_keys) + r'):\s*'
+
+            # Usar re.finditer para encontrar todas as ocorrências das chaves e suas posições no texto
+            matches = list(re.finditer(key_regex_pattern, ambientacao_full_block_text))
+            
+            for i, match in enumerate(matches):
+                key_found_in_text = match.group(1).strip() # A chave completa encontrada (ex: "Nome do cliente")
+                start_of_value = match.end() # Posição no texto onde o valor começa (depois de "Chave: ")
+
+                # Determinar o fim do valor:
+                # É o início da próxima chave encontrada ou o final do bloco de texto se for a última chave.
+                end_of_value = len(ambientacao_full_block_text)
+                if i + 1 < len(matches):
+                    end_of_value = matches[i+1].start()
+                
+                value = ambientacao_full_block_text[start_of_value:end_of_value].strip()
+                
+                # Mapear a chave encontrada para a chave de metadado padronizada
+                standardized_key = known_keys_map.get(key_found_in_text)
+                if standardized_key and value: # Se a chave for mapeada e o valor não estiver vazio
+                    content_specific_metadata[standardized_key] = value
+
+        # --- FIM DA LÓGICA DE EXTRAÇÃO DE METADADOS DO CONTEÚDO ---
+
+        # Concatenar o texto de todos os elementos extraídos para o full_text principal.
         full_text = "\n\n".join([str(el) for el in elements if el.text.strip()])
 
-        return full_text
+        return full_text, content_specific_metadata
 
     except Exception as e:
-        print(f"Erro ao extrair texto do arquivo '{file_path}' usando unstructured: {e}")
-        # Retorna uma string vazia em caso de erro para não quebrar o pipeline.
-        return ""
+        print(f"Erro ao extrair texto e metadados do arquivo '{file_path}' usando unstructured: {e}")
+        return "", {}
 
 # --- Bloco de Teste Rápido (Executado apenas quando o script é rodado diretamente) ---
 if __name__ == "__main__":
     print("--- Testando document_parser.py com unstructured ---")
 
-    # Garante que a pasta de documentos brutos exista para nossos testes
-    # O caminho deve ser relativo ao diretório raiz do projeto para o teste funcionar.
     current_dir = os.path.dirname(__file__)
     raw_documents_path = os.path.abspath(os.path.join(current_dir, '../../data/raw_documents'))
     os.makedirs(raw_documents_path, exist_ok=True)
 
     print(f"Verificando a pasta de documentos: {raw_documents_path}")
 
-    # 1. Teste com arquivo TXT
-    dummy_txt_file = os.path.join(raw_documents_path, 'teste_copilot.txt')
-    with open(dummy_txt_file, 'w', encoding='utf-8') as f:
-        f.write("Este é um documento de texto simples para teste.\n")
-        f.write("Contém algumas linhas de exemplo para verificar a extração.\n")
-        f.write("O TCRM Copilot promete automatizar tarefas e gerar inteligência.\n")
-        f.write("--- Tabela Simples (para ver como unstructured lida) ---\n")
-        f.write("Item | Quantidade | Preço\n")
-        f.write("------------------------\n")
-        f.write("Caneta | 10 | 2.50\n")
-        f.write("Lápis | 5 | 1.00\n")
-
-    print(f"\nExtraindo de TXT: {dummy_txt_file}")
-    txt_content = extract_text_from_file_unstructured(dummy_txt_file)
-    print(f"Conteúdo:\n---\n{txt_content}\n---")
-    os.remove(dummy_txt_file) # Limpa o arquivo de teste
-
-    # 2. Teste com arquivo PDF (requer um PDF de verdade na pasta)
+    # Crie um arquivo DOCX de teste na pasta 'data/raw_documents'
     # Use o documento "[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx"
-    # ou um PDF similar que contenha tabelas e cabeçalhos.
-    # Salve-o como 'scens_escopo.pdf' (ou o nome original) dentro de 'data/raw_documents'
-    dummy_pdf_file = os.path.join(raw_documents_path, 'scens_escopo.pdf')
-    print(f"\nExtraindo de PDF: {dummy_pdf_file}")
-    if os.path.exists(dummy_pdf_file):
-        pdf_content = extract_text_from_file_unstructured(dummy_pdf_file)
-        print(f"Conteúdo (primeiros 500 caracteres):\n---\n{pdf_content[:500]}...\n---")
-        # Para inspecionar melhor a saída, você pode querer salvar para um arquivo:
-        with open("pdf_extracted_text.txt", "w", encoding="utf-8") as f:
-            f.write(pdf_content)
-        print("Conteúdo completo do PDF salvo em 'pdf_extracted_text.txt'")
-    else:
-        print(f"ATENÇÃO: Crie um arquivo PDF '{os.path.basename(dummy_pdf_file)}' em '{raw_documents_path}' para testar a extração de PDF.")
-
-    # 3. Teste com arquivo DOCX (requer um DOCX de verdade na pasta)
-    # Coloque o documento "[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx"
-    # dentro de 'data/raw_documents'.
     dummy_docx_file = os.path.join(raw_documents_path, '[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx')
     print(f"\nExtraindo de DOCX: {dummy_docx_file}")
     if os.path.exists(dummy_docx_file):
-        docx_content = extract_text_from_file_unstructured(dummy_docx_file)
+        docx_content, docx_metadata = extract_text_from_file_unstructured(dummy_docx_file)
         print(f"Conteúdo (primeiros 500 caracteres):\n---\n{docx_content[:500]}...\n---")
-        # Para inspecionar melhor a saída:
-        with open("docx_extracted_text.txt", "w", encoding="utf-8") as f:
-            f.write(docx_content)
-        print("Conteúdo completo do DOCX salvo em 'docx_extracted_text.txt'")
+        print(f"Metadados extraídos do conteúdo:\n---\n{docx_metadata}\n---")
+        
+        with open("docx_extracted_text_and_metadata.txt", "w", encoding="utf-8") as f:
+            f.write(f"FULL TEXT:\n{docx_content}\n\nMETADATA:\n{docx_metadata}")
+        print("Conteúdo completo do DOCX e metadados salvos em 'docx_extracted_text_and_metadata.txt'")
     else:
-        print(f"ATENÇÃO: Coloque o arquivo DOCX '{os.path.basename(dummy_docx_file)}' em '{raw_documents_path}' para testar a extração de DOCX.")
+        print(f"ATENÇÃO: Coloque o arquivo DOCX '{os.path.basename(dummy_docx_file)}' em '{raw_documents_path}' para testar a extração de DOCX e metadados.")
 
     print("\n--- Fim do Teste com unstructured ---")
-    print("Verifique os outputs para ver como o unstructured está lidando com a estrutura dos documentos.")
+    print("Verifique os outputs para ver como o unstructured está lidando com a estrutura dos documentos e a extração de metadados.")

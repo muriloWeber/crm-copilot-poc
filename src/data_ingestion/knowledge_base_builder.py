@@ -2,42 +2,48 @@
 
 import os
 import shutil
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Tuple
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from .document_parser import extract_text_from_file_unstructured # Importa o nosso parser aprimorado
-import httpx # <<<--- NOVA IMPORTAÇÃO NECESSÁRIA
+from .document_parser import extract_text_from_file_unstructured
+import httpx # Importe httpx
 
-# Configurações globais para o RAG (podem ser movidas para um arquivo de config depois)
-# Importante: O modelo de embedding está definido no PoC como text-embedding-ada-002
-# Para gpt-4o-mini ou outros modelos, geralmente 'text-embedding-ada-002' ou 'text-embedding-3-small' são boas opções de embedding.
+# Configurações globais para o RAG
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
 CHROMA_DB_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data/chroma_db'))
-CHUNK_SIZE = 1000 # Tamanho ideal de chunk depende do modelo e da natureza do texto
-CHUNK_OVERLAP = 200 # Sobreposição entre chunks para não perder contexto entre eles
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+def extract_doc_id_from_filename(filename: str) -> str | None:
+    """
+    Extrai o ID do documento (ex: MIT041) do nome de arquivo, baseado no padrão esperado.
+    Ex: "[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx"
+    """
+    # Regex mais robusta para pegar o MITXXX, mesmo que tenha outros códigos perto
+    match = re.search(r'\b([A-Z]{3}\d{3})\b', filename)
+    if match:
+        return match.group(1)
+    return None
 
 def initialize_embedding_model():
     """
     Inicializa o modelo de embeddings da OpenAI.
-    Certifique-se de que a variável de ambiente OPENAI_API_KEY esteja configurada.
-    Em ambientes corporativos com proxy interceptador, pode ser necessário desabilitar
-    a verificação SSL com 'verify=False' no cliente HTTP.
     """
     try:
+        # Pega a base_url do ambiente, se existir. Para proxys como o da TOTVS.
         openai_api_base = os.getenv("OPENAI_API_BASE")
         
-        # --- CORREÇÃO APLICADA: Configurando httpx.Client diretamente ---
-        # Cria um cliente httpx com a verificação SSL desabilitada.
-        # Isso é o que o 'openai' (e por consequência o 'langchain_openai') usa internamente.
+        # Cria um cliente HTTP personalizado para httpx (para permitir verify=False, se necessário)
+        # Atenção: verify=False desabilita a verificação de certificados SSL e deve ser usado com cautela em produção.
+        # É útil em ambientes de desenvolvimento ou com proxies que interceptam SSL.
         custom_http_client = httpx.Client(verify=False)
 
-        # Passa a base_url diretamente e o cliente httpx configurado para o OpenAIEmbeddings.
-        # Assim, evitamos o 'client_kwargs' que estava causando o TypeError.
         return OpenAIEmbeddings(
             model=EMBEDDING_MODEL_NAME,
-            base_url=openai_api_base if openai_api_base else None,
-            http_client=custom_http_client
+            base_url=openai_api_base if openai_api_base else None, # Usa base_url se definida
+            http_client=custom_http_client # Passa o cliente HTTP personalizado
         )
     except Exception as e:
         print(f"Erro ao inicializar o modelo de embeddings: {e}")
@@ -53,8 +59,6 @@ def create_vector_store(texts: List[str], metadatas: List[Dict[str, Any]], embed
         print("Modelo de embeddings não inicializado. Não é possível criar o vector store.")
         return None
 
-    # Verifica se já existe um diretório Chroma para a coleção e o remove para recriar (para PoC)
-    # Em produção, você adicionaria novos documentos ou faria atualizações incrementais.
     collection_path = os.path.join(CHROMA_DB_DIRECTORY, collection_name)
     if os.path.exists(collection_path):
         print(f"Removendo coleção ChromaDB existente em: {collection_path}")
@@ -68,102 +72,126 @@ def create_vector_store(texts: List[str], metadatas: List[Dict[str, Any]], embed
         persist_directory=CHROMA_DB_DIRECTORY,
         collection_name=collection_name
     )
-    vector_store.persist()
+    # Com Chroma 0.4.x+, .persist() não é mais necessário e gera warning.
+    # Mas se você estiver em uma versão anterior ou quiser ser explícito, pode manter.
+    # Por agora, vamos manter, mas esteja ciente do warning.
+    # vector_store.persist() # Removido para evitar o warning de depreciação
     print("ChromaDB criado e persistido com sucesso!")
     return vector_store
 
 def build_knowledge_base_from_documents(document_paths: List[str], collection_name: str = "tcrm_copilot_kb"):
     """
     Orquestra a extração de texto, chunking, embedding e armazenamento no ChromaDB
-    a partir de uma lista de caminhos de documentos.
+    a partir de uma lista de caminhos de documentos, enriquecendo metadados.
     """
     embeddings_model = initialize_embedding_model()
     if not embeddings_model:
         return None
 
-    all_chunks = []
+    all_chunks_content = []
     all_metadatas = []
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        length_function=len, # Usa len() para contar caracteres, em vez de tokens
-        add_start_index=True # Adiciona o índice de início do chunk no documento original
+        length_function=len,
+        add_start_index=True
     )
 
     print(f"Processando {len(document_paths)} documentos...")
     for doc_path in document_paths:
         file_name = os.path.basename(doc_path)
-        print(f"Extraindo texto de {file_name}...")
-        full_text = extract_text_from_file_unstructured(doc_path)
+        print(f"Extraindo texto e metadados de {file_name}...")
+        
+        # Recebendo duas saídas do parser
+        full_text, content_specific_metadata = extract_text_from_file_unstructured(doc_path)
+        
+        # Extrai o document_id do nome do arquivo
+        document_id = extract_doc_id_from_filename(file_name)
+        if document_id:
+            print(f" - ID do Documento (filename) detectado: {document_id}")
+        else:
+            print(f" - Nenhum ID de Documento (ex: MIT041) detectado no nome do arquivo '{file_name}'.")
 
         if full_text:
-            # Divide o texto em chunks
-            chunks = text_splitter.create_documents([full_text]) # LangChain Document objects
+            # Metadados base para os chunks (vindos do nome do arquivo e tipo)
+            base_metadata = {
+                'source': file_name,
+                'filename': file_name,
+                'source_type': 'document'
+            }
+            if document_id:
+                base_metadata['document_id'] = document_id
 
-            for i, chunk in enumerate(chunks):
-                # Adiciona metadados conforme especificado no PoC
-                metadata = chunk.metadata
-                metadata['source'] = file_name
-                metadata['filename'] = file_name
-                metadata['source_type'] = 'document'
-                # O 'page' ou 'field' pode ser mais complexo com unstructured,
-                # unstructured.partition pode retornar elementos com page_number,
-                # mas para simplificar aqui, deixamos o filename como identificador principal.
-                # Poderíamos refinar isso para incluir o page_number se unstructured fornecer.
-
-                all_chunks.append(chunk.page_content)
-                all_metadatas.append(metadata)
-            print(f" - {len(chunks)} chunks gerados para {file_name}")
+            # Mescla os metadados base com os metadados extraídos do conteúdo.
+            # Metadados do conteúdo têm prioridade se houver conflito de chaves.
+            combined_metadata = {**base_metadata, **content_specific_metadata}
+            
+            # Passamos os metadados combinados para cada Document gerado
+            doc_chunk_objects = text_splitter.create_documents([full_text], metadatas=[combined_metadata])
+            
+            for chunk_obj in doc_chunk_objects:
+                all_chunks_content.append(chunk_obj.page_content)
+                all_metadatas.append(chunk_obj.metadata) # O chunk_obj.metadata já contém tudo mesclado
+            print(f" - {len(doc_chunk_objects)} chunks gerados para {file_name} com metadados enriquecidos.")
         else:
             print(f" - Nenhum texto extraído de {file_name}. Pulando.")
 
-    if not all_chunks:
+    if not all_chunks_content:
         print("Nenhum chunk de texto disponível para criar o banco de conhecimento.")
         return None
 
-    vector_store = create_vector_store(all_chunks, all_metadatas, embeddings_model, collection_name)
+    vector_store = create_vector_store(all_chunks_content, all_metadatas, embeddings_model, collection_name)
     return vector_store
 
 # --- Bloco de Teste Rápido ---
 if __name__ == "__main__":
     print("--- Iniciando construção da Base de Conhecimento ---")
 
-    # Garante que a pasta de documentos brutos exista
     current_dir = os.path.dirname(__file__)
     raw_documents_path = os.path.abspath(os.path.join(current_dir, '../../data/raw_documents'))
     os.makedirs(raw_documents_path, exist_ok=True)
 
-    # Crie alguns arquivos de teste ou use os existentes que você salvou
-    # Exemplo de documentos para a PoC (coloque seus arquivos reais aqui)
-    # Por exemplo: seu DOCX da SCENS e um PDF de exemplo
     doc_paths = []
+    # Incluindo todos os documentos .pdf, .docx, .txt da pasta raw_documents
     for file_name in os.listdir(raw_documents_path):
         if file_name.endswith(('.pdf', '.docx', '.txt')):
             doc_paths.append(os.path.join(raw_documents_path, file_name))
 
-    # O ChromaDB será criado em '../../data/chroma_db'
     knowledge_base = build_knowledge_base_from_documents(doc_paths, collection_name="tcrm_copilot_poc_kb")
 
     if knowledge_base:
         print("\nBase de Conhecimento RAG construída com sucesso!")
         print(f"ChromaDB persistido em: {CHROMA_DB_DIRECTORY}")
+        
+        print("\n--- Realizando busca de teste com filtro de metadados ---")
+        # Exemplo de query para verificar os novos metadados
+        query_with_filter = "Qual o coordenador da TOTVS para o projeto SCENS?"
+        # Filtro combinado CORRIGIDO para usar o operador $and do ChromaDB
+        filter_metadata = {
+            "$and": [
+                {"document_id": "MIT041"},
+                {"client_name": "SCENS INDUSTRIA E COMERCIO DE FRAGRANCIAS LTDA"}
+            ]
+        }
+        print(f"Buscando: '{query_with_filter}' com filtro: {filter_metadata}")
+        
+        try:
+            results_filtered = knowledge_base.similarity_search(query_with_filter, k=3, filter=filter_metadata)
+            if results_filtered:
+                print("\nResultados da busca filtrada:")
+                for i, doc in enumerate(results_filtered):
+                    print(f"--- Documento Filtrado {i+1} ---")
+                    print(f"Source: {doc.metadata.get('source', 'N/A')}")
+                    print(f"Document ID: {doc.metadata.get('document_id', 'N/A')}")
+                    print(f"Client Name: {doc.metadata.get('client_name', 'N/A')}")
+                    print(f"TOTVS Coordinator: {doc.metadata.get('totvs_coordinator', 'N/A')}")
+                    print(f"Content (parcial): {doc.page_content[:200]}...")
+                    print("-" * 20)
+            else:
+                print("Nenhum resultado encontrado para a busca filtrada com esses critérios.")
+        except Exception as e:
+            print(f"Erro ao realizar busca filtrada: {e}")
+            print("Verifique a documentação do ChromaDB para filtros ou se os metadados foram corretamente indexados.")
 
-        # Exemplo de como fazer uma busca simples (para verificar se funciona)
-        query = "Qual o nome do cliente do projeto Scens?"
-        print(f"\nRealizando uma busca de teste: '{query}'")
-        results = knowledge_base.similarity_search(query, k=2) # Busca os 2 chunks mais relevantes
-
-        if results:
-            print("\nResultados da busca:")
-            for i, doc in enumerate(results):
-                print(f"--- Documento {i+1} ---")
-                print(f"Source: {doc.metadata.get('source', 'N/A')}")
-                print(f"Content (parcial): {doc.page_content[:200]}...")
-                print("-" * 20)
-        else:
-            print("Nenhum resultado encontrado para a busca de teste.")
-    else:
-        print("Falha na construção da Base de Conhecimento RAG.")
-
-    print("\n--- Fim da Construção da Base de Conhecimento ---")
+        print("\n--- Fim da Construção da Base de Conhecimento ---")
