@@ -4,11 +4,11 @@ import os
 import shutil
 import re
 from typing import List, Dict, Any, Tuple
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from .document_parser import extract_text_from_file_unstructured
-import httpx # Importe httpx
+import httpx
 
 # Configurações globais para o RAG
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
