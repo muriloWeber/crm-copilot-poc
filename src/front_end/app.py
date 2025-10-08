@@ -4,9 +4,8 @@ from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 import httpx
 import time
-
-# Adiciona import do Settings do ChromaDB
 from chromadb.config import Settings
+from dotenv import load_dotenv
 
 
 # --- Configuração ---
