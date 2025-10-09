@@ -1,19 +1,19 @@
 # src/core/copilot_agent.py
 import os
-from typing import TypedDict, List
+from typing import TypedDict, List, Optional
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
-import httpx # Importa httpx para configurar o cliente http do OpenAI
-from chromadb.config import Settings # Importa Settings do ChromaDB
+import httpx
+from chromadb.config import Settings
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # --- 1. Definição do AgentState ---
-# Este é o esquema de dados que será passado entre os nós do LangGraph.
-# Ele define o 'estado' da nossa conversa/processamento.
 class AgentState(TypedDict):
     """
     Representa o estado do agente Copilot.
@@ -22,13 +22,14 @@ class AgentState(TypedDict):
     source_docs: Uma lista de dicionários contendo metadados detalhados dos chunks.
     answer: A resposta gerada pelo LLM.
     messages: Histórico de mensagens da conversa (opcional para PoC inicial, mas bom para expansão).
+    filters: Um dicionário de filtros aplicados à recuperação.
     """
     question: str
     context: List[Document]
-    source_docs: List[dict] # Para metadados detalhados
+    source_docs: List[dict]
     answer: str
-    messages: List[BaseMessage] # Embora não usaremos para history na PoC, é bom ter
-
+    messages: List[BaseMessage]
+    filters: Optional[dict] # Adicionado aqui para permitir filtros no estado
 
 # --- 2. Configurações e Inicialização do LLM ---
 def get_llm():
@@ -54,14 +55,18 @@ llm = get_llm()
 
 # --- 3. Definição dos Nós (Nodes) ---
 
-def retrieve_context_node(state: AgentState, vector_store: Chroma, filters: dict = None):
+def retrieve_context_node(state: AgentState, vector_store: Chroma, filters: Optional[dict] = None):
     """
     Nó para recuperar chunks relevantes da base de conhecimento.
     Recebe a pergunta do usuário e quaisquer filtros ativos.
     """
     print(f"DEBUG: Executando retrieve_context_node para a pergunta: {state['question']}")
     question = state["question"]
-    # Aqui, a lógica de filtro é aplicada durante a busca por similaridade
+
+    # Usa os filtros diretamente como são passados.
+    # Assumimos que as chaves em 'filters' correspondem às chaves nos metadados do ChromaDB
+    # definidos durante a ingestão pelo knowledge_base_builder.py.
+    # Ex: filters = {"document_id": "document.pdf", "client_name": "SCENS"}
     if filters:
         print(f"DEBUG: Aplicando filtros na recuperação: {filters}")
         retrieved_docs = vector_store.similarity_search(question, k=5, filter=filters)
@@ -72,8 +77,8 @@ def retrieve_context_node(state: AgentState, vector_store: Chroma, filters: dict
     source_docs_metadata = []
     for doc in retrieved_docs:
         source_docs_metadata.append({
-            "source": doc.metadata.get('source', 'N/A'),
-            "document_id": doc.metadata.get('document_id', 'N/A'),
+            "source": doc.metadata.get('source', 'N/A'), # O caminho completo do arquivo
+            "document_id": doc.metadata.get('document_id', 'N/A'), # O nome do arquivo (ex: TCRM_Copilot_Projeto.pdf)
             "client_name": doc.metadata.get('client_name', 'N/A'),
             "totvs_coordinator": doc.metadata.get('totvs_coordinator', 'N/A'),
             "project_code_crm": doc.metadata.get('project_code_crm', 'N/A'),
@@ -125,22 +130,31 @@ def format_citation_node(state: AgentState):
     seen_sources = set() # Para evitar duplicar citações da mesma fonte
 
     for doc_meta in source_docs:
-        source_id = f"{doc_meta['source']}"
-        if source_id not in seen_sources:
-            citations.append(f"- **Origem:** {doc_meta['source']} (ID: {doc_meta['document_id']}, Cliente: {doc_meta['client_name']})")
-            seen_sources.add(source_id)
+        # Usamos 'document_id' para o nome do arquivo, que é mais amigável para o usuário.
+        # Adicione outros metadados para enriquecer a citação.
+        citation_text = f"**{doc_meta['document_id']}**"
+        
+        # Adiciona detalhes apenas se existirem e forem diferentes de 'N/A'
+        details = []
+        if doc_meta.get('client_name') and doc_meta['client_name'] != 'N/A':
+            details.append(f"Cliente: {doc_meta['client_name']}")
+        if doc_meta.get('totvs_coordinator') and doc_meta['totvs_coordinator'] != 'N/A':
+            details.append(f"Coordenador TOTVS: {doc_meta['totvs_coordinator']}")
+        if doc_meta.get('project_code_crm') and doc_meta['project_code_crm'] != 'N/A':
+            details.append(f"Código Projeto CRM: {doc_meta['project_code_crm']}")
+
+        if details:
+            citation_text += f" ({', '.join(details)})"
+
+        if citation_text not in seen_sources:
+            citations.append(citation_text)
+            seen_sources.add(citation_text)
 
     if citations:
-        formatted_citations = "\n".join(citations)
+        formatted_citations = "\n".join([f"- {c}" for c in citations])
         final_answer = f"{answer}\n\n**Fontes Consultadas:**\n{formatted_citations}"
     else:
         final_answer = answer # Se não houver citações, apenas retorna a resposta
 
     print("DEBUG: Citações formatadas.")
     return {"answer": final_answer}
-
-
-# --- LangGraph Orchestration (Será adicionado no próximo passo, mas a estrutura já está aqui) ---
-# A montagem do StateGraph, incluindo 'add_node', 'set_entry_point' e 'add_edge'
-# será feita quando integrarmos isso ao app.py, para que o vector_store seja
-# passado corretamente.

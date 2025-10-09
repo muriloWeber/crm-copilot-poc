@@ -5,6 +5,7 @@ import shutil
 import re
 from typing import List, Dict, Any
 from dotenv import load_dotenv
+load_dotenv()
 
 # LangChain/ChromaDB imports
 from langchain_chroma import Chroma
