@@ -25,8 +25,8 @@ import sys
 CHROMA_DB_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'chroma_db'))
 RAW_DOCUMENTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'raw_documents'))
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 250
+CHUNK_OVERLAP = 50
 
 def extract_metadata_from_content(text_content: str) -> Dict[str, str]:
     """
