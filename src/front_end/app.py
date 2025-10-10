@@ -42,7 +42,8 @@ def create_agent_workflow():
 # Certifique-se que o build_knowledge_base já foi executado!
 try:
     copilot_agent = create_agent_workflow()
-    llm = get_llm() # Obtém a instância do LLM uma vez
+    # Não é necessário chamar get_llm() aqui se o copilot_agent já está compilado com ele
+    # e não precisamos do objeto LLM diretamente para a UI.
     st.session_state.llm_initialized = True
 except Exception as e:
     st.error(f"Erro ao inicializar o Copilot: {e}. Certifique-se de que a base de conhecimento foi construída e as variáveis de ambiente estão corretas.")
@@ -58,8 +59,10 @@ st.markdown("Seu assistente de IA para projetos TOTVS CRM.")
 # Inicializar histórico de chat na sessão do Streamlit
 if "messages" not in st.session_state:
     st.session_state.messages = []
+# Ensure llm_initialized is set even if not initially found, to prevent KeyError
 if "llm_initialized" not in st.session_state:
-    st.session_state.llm_initialized = False
+    st.session_state.llm_initialized = False # Default to False if not set by try/except
+
 
 # Display de mensagens anteriores
 for message in st.session_state.messages:
@@ -78,23 +81,33 @@ if prompt := st.chat_input("Pergunte ao Copilot sobre seu projeto..."):
 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        full_response = ""
+        
+        # Variável para acumular a simulação de digitação
+        accumulated_text_for_display = ""
+        # Variável para guardar a resposta FINAL do agente
+        agent_final_response_content = ""
+
         try:
             # Invocar o agente LangGraph
             inputs = {"question": prompt, "messages": st.session_state.messages} # Adiciona o histórico para contexto
             response = copilot_agent.invoke(inputs)
+            
             # A resposta final formatada já deve estar em response['answer']
-            full_response = response.get("answer", "Não consegui gerar uma resposta para isso. Tente refazer a pergunta ou fornecer mais contexto.")
+            agent_final_response_content = response.get("answer", "Não consegui gerar uma resposta para isso. Tente refazer a pergunta ou fornecer mais contexto.")
 
-            # Simular digitação
-            for chunk in full_response.split(" "):
-                full_response += chunk + " "
+            # Simular digitação usando a variável temporária
+            for chunk in agent_final_response_content.split(" "):
+                accumulated_text_for_display += chunk + " "
                 time.sleep(0.05)
-                message_placeholder.markdown(full_response + "▌")
-            message_placeholder.markdown(full_response)
+                message_placeholder.markdown(accumulated_text_for_display + "▌")
+            
+            # Exiba a resposta COMPLETA e FINAL (sem o cursor piscando)
+            message_placeholder.markdown(agent_final_response_content)
 
         except Exception as e:
             st.error(f"Ocorreu um erro ao processar sua pergunta: {e}")
-            full_response = "Ops! Parece que algo deu errado. Por favor, tente novamente."
+            agent_final_response_content = "Ops! Parece que algo deu errado. Por favor, tente novamente."
+            message_placeholder.markdown(agent_final_response_content) # Exibe a mensagem de erro
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    # Apenas UMA VEZ, adicione a resposta final (limpa e completa) ao histórico da sessão
+    st.session_state.messages.append({"role": "assistant", "content": agent_final_response_content})

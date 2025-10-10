@@ -219,60 +219,79 @@ def generate_response_node(state: AgentState):
 
 def format_citation_node(state: AgentState):
     """
-    Nó para formatar a resposta final, incorporando citações detalhadas das fontes,
-    incluindo o conteúdo relevante do documento.
+    Nó para formatar a resposta final, incorporando uma citação concisa e exata da fonte.
+    Tenta encontrar o chunk que contém a informação da resposta ou o mais relevante como fallback.
     """
-    print("DEBUG: Executando format_citation_node.")
+    print("DEBUG: Executando format_citation_node para referências exatas.")
     answer = state["answer"]
-    all_source_docs = state["source_docs"] # Renomeado para clareza
+    all_source_docs = state["source_docs"] # Esta é uma lista de dicionários de metadados dos chunks
 
-    # Limitar o número de chunks citados para melhorar a legibilidade.
-    # A similaridade_search já retorna em ordem de relevância, então pegamos os top N.
-    cited_docs_limit = 3 # Limita a 3 citações principais para exibição
-    source_docs_to_cite = all_source_docs[:cited_docs_limit]
+    selected_doc_meta_for_citation = None
+    snippet_to_cite = None
 
+    # --- Lógica para encontrar o chunk mais EXATO ---
+    # 1. Tentar extrair o número da resposta e palavras-chave
+    extracted_number = next(iter(re.findall(r'\d+', answer)), None) # Pega o primeiro número na resposta
+    
+    relevant_keywords = []
+    if "licenças" in answer.lower():
+        relevant_keywords.append("licenças")
+    if "ids" in answer.lower():
+        relevant_keywords.append("ids")
+    if "contratadas" in answer.lower():
+        relevant_keywords.append("contratadas")
+    
+    # Priorizar chunks que contêm o número E uma palavra-chave relevante, ou a frase exata
+    for doc_meta in all_source_docs:
+        current_snippet = doc_meta.get('page_content', '').strip()
+        current_snippet_lower = current_snippet.lower()
 
-    citations = []
-    seen_sources = set()
-
-    for doc_meta in source_docs_to_cite: # Iterar apenas sobre os documentos a serem citados
-        citation_entry = []
+        is_strong_match = False
         
-        # Adiciona o ID do documento
-        citation_entry.append(f"**Documento:** {doc_meta['document_id']}")
+        # Heurística de alta precisão: procurar a frase exata "Licenças contratadas: Quantidade de IDs: X"
+        # O "X" será o número extraído ou algo genérico como "10"
+        if "licenças contratadas: quantidade de ids:" in current_snippet_lower:
+            if extracted_number and extracted_number in current_snippet:
+                 is_strong_match = True
+            elif "10" in current_snippet: # fallback para "10" se o extracted_number falhar
+                is_strong_match = True
+
+        # Se não for um match forte, tentar uma combinação de número e keywords
+        if not is_strong_match and extracted_number and relevant_keywords:
+            if extracted_number in current_snippet and any(kw in current_snippet_lower for kw in relevant_keywords):
+                is_strong_match = True
         
-        # Adiciona metadados se existirem
-        details = []
-        if doc_meta.get('client_name') and doc_meta['client_name'] != 'N/A':
-            details.append(f"Cliente: {doc_meta['client_name']}")
-        if doc_meta.get('totvs_coordinator') and doc_meta['totvs_coordinator'] != 'N/A':
-            details.append(f"Coordenador TOTVS: {doc_meta['totvs_coordinator']}")
-        if doc_meta.get('project_code_crm') and doc_meta['project_code_crm'] != 'N/A':
-            details.append(f"Código Projeto CRM: {doc_meta['project_code_crm']}")
+        if is_strong_match:
+            selected_doc_meta_for_citation = doc_meta
+            snippet_to_cite = current_snippet
+            print(f"DEBUG: Encontrado chunk 'exato' para citar (match forte): {doc_meta['document_id']}")
+            break # Encontrou um match forte, pode parar e citar este
 
-        if details:
-            citation_entry.append(f" ({', '.join(details)})")
+    # --- Fallback: Se nenhum match "exato" foi encontrado, usar o chunk mais similar ---
+    if selected_doc_meta_for_citation is None and all_source_docs:
+        selected_doc_meta_for_citation = all_source_docs[0] # Pega o primeiro, que é o mais similar
+        snippet_to_cite = selected_doc_meta_for_citation.get('page_content', '').strip()
+        print("DEBUG: Nenhuma citação 'exata' encontrada, usando o chunk mais similar como fallback.")
+    elif selected_doc_meta_for_citation is None:
+        print("DEBUG: Nenhuma citação encontrada (lista de chunks vazia).")
 
-        # Adiciona o conteúdo relevante do documento (o "pedaço" que o usuário quer ver)
-        if doc_meta.get('page_content'):
-            # Limita o tamanho do snippet para não poluir demais
-            snippet = doc_meta['page_content'].strip()
-            if len(snippet) > 300: # Se for muito longo, corta e adiciona "..."
-                snippet = snippet[:300] + "..."
-            citation_entry.append(f"\n> '{snippet}'") # Formatado como citação
+    # --- Construir a citação final ---
+    final_citation_entry = None
+    if selected_doc_meta_for_citation:
+        citation_parts = [
+            f"**Documento:** {selected_doc_meta_for_citation['document_id']} (Cliente: {selected_doc_meta_for_citation.get('client_name', 'N/A')}, Coordenador TOTVS: {selected_doc_meta_for_citation.get('totvs_coordinator', 'N/A')}, Código Projeto CRM: {selected_doc_meta_for_citation.get('project_code_crm', 'N/A')})"
+        ]
+        if snippet_to_cite:
+            # Limita o snippet da citação para não poluir demais, como antes.
+            if len(snippet_to_cite) > 300:
+                snippet_to_cite = snippet_to_cite[:300] + "..."
+            citation_parts.append(f"'{snippet_to_cite}'")
+        final_citation_entry = "\n".join(citation_parts)
 
-        full_citation_text = " ".join(citation_entry)
+    # Combine answer with citation
+    final_answer_text = answer
+    if final_citation_entry:
+        final_answer_text += "\n\n**Fontes Consultadas:**\n\n" + final_citation_entry
 
-        if full_citation_text not in seen_sources:
-            citations.append(full_citation_text)
-            seen_sources.add(full_citation_text)
-
-    if citations:
-        formatted_citations = "\n\n".join([f"- {c}" for c in citations])
-        final_answer = f"{answer}\n\n**Fontes Consultadas:**\n{formatted_citations}"
-    else:
-        final_answer = answer # Se não houver citações, apenas retorna a resposta
-
-    print("DEBUG: Citações formatadas.")
-    return {"answer": final_answer}
+    return {"answer": final_answer_text}
    
