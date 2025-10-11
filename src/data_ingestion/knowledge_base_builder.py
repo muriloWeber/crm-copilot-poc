@@ -1,186 +1,165 @@
-# src/data_ingestion/knowledge_base_builder.py
-
 import os
-import shutil
 import re
+import shutil
+import pathlib
 from typing import List, Dict, Any
+
+from langchain_community.document_loaders import UnstructuredFileLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
 from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente (como OPENAI_API_KEY)
 load_dotenv()
 
-# LangChain/ChromaDB imports
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+# --- Configurações ---
+# Diretório onde os documentos crus (PDF, DOCX, TXT) estão localizados
+RAW_DOCS_DIR = pathlib.Path("data/raw_documents")
+# Diretório onde o banco de vetores Chroma será armazenado
+VECTOR_DB_DIR = pathlib.Path("data/vector_db/chroma_db")
 
-# Unstructured for document parsing
-from unstructured.partition.auto import partition
-from unstructured.documents.elements import Text
+# Tamanho de cada pedaço de texto (chunk) para o LLM
+CHUNK_SIZE = 1000
+# Sobreposição entre chunks para manter o contexto
+CHUNK_OVERLAP = 200
+# Modelo de embedding da OpenAI
+EMBEDDING_MODEL = "text-embedding-ada-002"
 
-# HTTPX for custom client (proxy/SSL)
-import httpx
-import sys
+# --- Funções de Ajuda ---
 
-# --- Configuration ---
-CHROMA_DB_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'chroma_db'))
-RAW_DOCUMENTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'raw_documents'))
-EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
-CHUNK_SIZE = 250
-CHUNK_OVERLAP = 50
-
-def extract_metadata_from_content(text_content: str) -> Dict[str, str]:
+def extract_metadata_from_document_content(doc_content: str, filename: str) -> Dict[str, str]:
     """
-    Extrai metadados específicos de um conteúdo textual, focando na seção 'AMBIENTAÇÃO'.
-    Utiliza expressões regulares para buscar campos como 'Nome do cliente', 'Código do projeto', etc.
-    Melhorado para lidar com formatação de linhas e capturar apenas o valor.
+    Extrai o nome do cliente e o código do projeto do conteúdo do documento
+    com maior precisão, priorizando o nome do arquivo para o cliente.
     """
-    metadata = {}
-    
-    # Define padrões para os rótulos que queremos extrair e seus delimitadores
-    # O (?:...) é um grupo de não-captura para os delimitadores
-    patterns = {
-        "client_name": r"Nome do cliente:\s*(.+?)(?:\n|Código de cliente:|Nome do projeto:|HISTÓRICO DE REVISÕES|SUMÁRIO|OBJETIVO|\Z)",
-        "project_code_crm": r"Código do projeto:\s*(.+?)(?:\n|Segmento cliente:|Unidade TOTVS:|HISTÓRICO DE REVISÕES|SUMÁRIO|OBJETIVO|\Z)",
-        "totvs_coordinator": r"Gerente\/Coordenador TOTVS:\s*(.+?)(?:\n|Gerente\/Coordenador cliente:|HISTÓRICO DE REVISÕES|SUMÁRIO|OBJETIVO|\Z)"
-    }
-    
-    # Tenta extrair a seção AMBIENTAÇÃO para restringir a busca de metadados, se ela existir.
-    # Usamos re.DOTALL para que '.' case com newlines também dentro da seção.
-    amb_match = re.search(r"AMBIENTAÇÃO\s*(.*?)(?=(?:HISTÓRICO DE REVISÕES|SUMÁRIO|OBJETIVO|$))", text_content, re.DOTALL | re.IGNORECASE)
-    
-    section_to_parse = text_content # Por padrão, busca no texto completo
-    if amb_match:
-        section_to_parse = amb_match.group(1) # Se encontrou, restringe a busca a essa seção
+    client_name = "Unknown Client"
+    project_code = "Unknown Project Code"
 
-    for key, pattern in patterns.items():
-        # Usar re.DOTALL aqui para que (.*?) possa atravessar linhas se necessário até o delimitador
-        match = re.search(pattern, section_to_parse, re.DOTALL | re.IGNORECASE)
-        if match:
-            # strip() para remover espaços em branco ou newlines extras
-            metadata[key] = match.group(1).strip()
+    # 1. EXTRAÇÃO DO NOME DO CLIENTE: Prioridade máxima para o nome do arquivo
+    # Ex: "[KION] - Escopo Técnico..." -> "KION"
+    filename_client_match = re.match(r"\[(.*?)\]", filename)
+    if filename_client_match:
+        client_name = filename_client_match.group(1).strip()
+    # NUNCA sobrescrever o client_name se encontrado no nome do arquivo.
+
+    # 2. EXTRAÇÃO DO CÓDIGO DO PROJETO: Buscar no conteúdo, com regex mais específica
+    # Ex: "Código do Projeto: D000071597001" -> "D000071597001"
+    project_code_match = re.search(
+        r"Código do Projeto:\s*(D\d{9,15}|\w{3}\d{3})", # Captura "D" + dígitos (pelo menos 9) OU "MIT" + 3 dígitos
+        doc_content, re.IGNORECASE
+    )
+    if project_code_match:
+        project_code = project_code_match.group(1).strip()
     
-    return metadata
-
-def parse_document(filepath: str) -> List[Document]:
-    """
-    Carrega e processa um documento, extraindo texto e metadados.
-    Tenta extrair metadados do conteúdo do documento.
-    """
-    filename = os.path.basename(filepath)
-    print(f"DEBUG: Parsing document: {filename}", flush=True)
-
-    try:
-        # Usar partition.auto para lidar com PDF, DOCX, TXT
-        # strategy="fast" para um processamento mais rápido
-        elements = partition(filename=filepath, strategy="fast", languages=["por"])
-        
-        # Concatena o texto dos elementos para a extração de metadados de conteúdo
-        # Filtra elementos que não são de texto para evitar erros em str(el)
-        full_text_content = "\n\n".join([str(el) for el in elements if isinstance(el, Text)])
-        
-        # Extrair metadados do conteúdo
-        content_metadata = extract_metadata_from_content(full_text_content)
-        
-        # Metadados base (do arquivo)
-        base_metadata = {
-            "source": filename,
-            "source_type": "document"
-        }
-        
-        # Ajustado para extrair "MIT041" de "MIT041 V1.0" ou de forma mais robusta
-        document_id = None
-        # Tenta pegar "MIT041"
-        mit_match = re.search(r"(MIT\d{3})", filename)
+    # Fallback para o código do projeto (se não encontrado no conteúdo, talvez MIT041 no nome do arquivo)
+    if project_code == "Unknown Project Code" or not project_code:
+        mit_match = re.search(r"(MIT\d{3})", filename, re.IGNORECASE)
         if mit_match:
-            document_id = mit_match.group(1)
-        else: # Tenta pegar qualquer coisa que se pareça com um ID de documento
-            # Pega o nome base do arquivo sem extensão e remove caracteres especiais
-            clean_filename = os.path.splitext(filename)[0]
-            # Remove "Scens", "Escopo Técnico", "TOTVS CRM", "Gestão de Clientes"
-            clean_filename = re.sub(r"\[?Scens\]? -? Escopo Técnico TOTVS CRM Gestão de Clientes -?", "", clean_filename, flags=re.IGNORECASE).strip()
-            # Pega a primeira sequência alfanumérica que não seja uma versão ou data
-            generic_id_match = re.search(r"(\w+)(?: V\d+\.\d+|\s\d{2}-\d{2}-\d{4})?", clean_filename)
-            if generic_id_match:
-                document_id = generic_id_match.group(1)
+            project_code = mit_match.group(1).strip() # Ex: MIT041
 
-        base_metadata["document_id"] = document_id if document_id else os.path.splitext(filename)[0].replace(' ', '_').replace('-', '_')
 
-        # Combina metadados do conteúdo com metadados base. Metadados do conteúdo têm precedência.
-        combined_metadata = {**base_metadata, **content_metadata}
+    return {
+        "client_name": client_name,
+        "project_code": project_code,
+        "original_filename": filename
+    }
 
-        # Cria um Document para o texto completo (pode ser dividido em chunks depois)
-        doc = Document(page_content=full_text_content, metadata=combined_metadata)
-        print(f"DEBUG: Document parsed: {filename} with metadata: {combined_metadata}", flush=True)
-        return [doc]
-    except Exception as e:
-        print(f"ERROR: Failed to parse {filename}: {e}", file=sys.stderr, flush=True)
-        return []
+def load_documents_with_enriched_metadata(directory: pathlib.Path) -> List[Document]:
+    """
+    Carrega documentos de um diretório, extrai metadados do conteúdo
+    e os adiciona ao objeto Document.
+    """
+    documents = []
+    for filepath in directory.iterdir():
+        if filepath.is_file() and filepath.suffix in [".pdf", ".docx", ".txt"]:
+            print(f"Loading and extracting metadata from: {filepath.name}")
+            try:
+                # Carrega o documento, focando no conteúdo para extração de metadados
+                loader = UnstructuredFileLoader(str(filepath), mode="elements")
+                
+                # O UnstructuredFileLoader pode retornar múltiplos elementos,
+                # vamos tentar pegar o texto completo para extração de metadados.
+                raw_docs_elements = loader.load()
+                full_content = "\n".join([doc.page_content for doc in raw_docs_elements])
+
+                # Extrai metadados personalizados
+                custom_metadata = extract_metadata_from_document_content(full_content, filepath.name)
+
+                # Criamos um único Documento para o arquivo completo, com os metadados.
+                # O text_splitter irá quebrar este Documento em chunks,
+                # e os metadados serão propagados.
+                doc = Document(
+                    page_content=full_content,
+                    metadata={
+                        "source": str(filepath),
+                        **custom_metadata # Adiciona os metadados customizados aqui
+                    }
+                )
+                documents.append(doc)
+                print(f"  -> Extracted Client: '{custom_metadata['client_name']}', Project Code: '{custom_metadata['project_code']}'")
+
+            except Exception as e:
+                print(f"Error loading or processing {filepath.name}: {e}")
+    return documents
+
+# --- Pipeline de Construção da Base de Conhecimento ---
 
 def build_knowledge_base():
-    print(f"--- Iniciando a construção da base de conhecimento ---", flush=True)
-    print(f"Diretório de documentos raw: {RAW_DOCUMENTS_DIR}", flush=True)
-    print(f"Diretório de destino do ChromaDB: {CHROMA_DB_DIRECTORY}", flush=True)
+    """
+    Constrói (ou reconstrói) a base de conhecimento (ChromaDB)
+    a partir dos documentos brutos.
+    """
+    print(f"Starting knowledge base construction...")
 
-    # Remove o diretório ChromaDB existente para garantir uma reconstrução limpa
-    if os.path.exists(CHROMA_DB_DIRECTORY):
-        print(f"DEBUG: Removendo diretório ChromaDB existente: {CHROMA_DB_DIRECTORY}", flush=True)
-        shutil.rmtree(CHROMA_DB_DIRECTORY)
-        print("DEBUG: Diretório ChromaDB removido com sucesso.", flush=True)
-    os.makedirs(CHROMA_DB_DIRECTORY, exist_ok=True) # Garante que o diretório base existe
-
-    loaded_documents: List[Document] = []
-    if not os.path.exists(RAW_DOCUMENTS_DIR):
-        print(f"WARNING: Diretório de documentos raw não encontrado: {RAW_DOCUMENTS_DIR}", file=sys.stderr, flush=True)
-    else:
-        for filename in os.listdir(RAW_DOCUMENTS_DIR):
-            filepath = os.path.join(RAW_DOCUMENTS_DIR, filename)
-            if os.path.isfile(filepath):
-                # Filtra arquivos temporários ou ocultos
-                if filename.startswith('~$') or filename.startswith('.'):
-                    print(f"DEBUG: Ignorando arquivo temporário/oculto: {filename}", flush=True)
-                    continue
-
-                print(f"DEBUG: Processando arquivo: {filepath}", flush=True)
-                parsed_docs = parse_document(filepath)
-                loaded_documents.extend(parsed_docs)
-
-    print(f"Total de {len(loaded_documents)} documentos carregados para chunking.", flush=True)
-    if not loaded_documents:
-        print("WARNING: Nenhum documento válido encontrado ou processado. ChromaDB será vazio.", file=sys.stderr, flush=True)
-        return # Sai da função se não houver documentos para processar
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    chunks = text_splitter.split_documents(loaded_documents)
-    print(f"Documentos divididos em {len(chunks)} chunks.", flush=True)
-
-    # OpenAI API Key para embeddings
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    openai_api_base = os.getenv("OPENAI_API_BASE")
-    if not openai_api_key:
-        print("ERROR: Variável de ambiente OPENAI_API_KEY não configurada. Não é possível gerar embeddings.", file=sys.stderr, flush=True)
+    # 1. Carregar documentos e extrair metadados enriquecidos
+    print(f"Loading documents from {RAW_DOCS_DIR}...")
+    documents = load_documents_with_enriched_metadata(RAW_DOCS_DIR)
+    if not documents:
+        print("No documents found or processed. Exiting.")
         return
 
-    embeddings_model = OpenAIEmbeddings(
-        model=EMBEDDING_MODEL_NAME,
-        openai_api_key=openai_api_key,
-        base_url=openai_api_base if openai_api_base else None,
-        http_client=httpx.Client(verify=False)
+    # 2. Dividir documentos em chunks
+    print(f"Splitting {len(documents)} document(s) into chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})...")
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
+        add_start_index=True,
     )
-    print("DEBUG: Modelo de embeddings carregado.", flush=True)
+    # A atenção aqui: `create_documents` ou `split_documents` da LangChain
+    # irá manter os metadados do documento original em cada chunk.
+    chunks = text_splitter.split_documents(documents)
+    print(f"Created {len(chunks)} chunks.")
 
-    print(f"DEBUG: Populando ChromaDB em {CHROMA_DB_DIRECTORY} com {len(chunks)} chunks...", flush=True)
-    vector_store = Chroma.from_documents(
+    # 3. Gerar embeddings
+    print(f"Initializing OpenAI embeddings with model '{EMBEDDING_MODEL}'...")
+    embeddings_model = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+    # 4. Popular ChromaDB
+    print(f"Populating ChromaDB at {VECTOR_DB_DIR}...")
+    
+    # Garante que o diretório do ChromaDB existe
+    VECTOR_DB_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Remove o conteúdo existente para reconstruir (opcional, mas bom para testes iniciais)
+    # Cuidado: shuta o balde!
+    if VECTOR_DB_DIR.exists() and any(VECTOR_DB_DIR.iterdir()):
+        print(f"  -> Existing ChromaDB detected. Deleting content for fresh build.")
+        for item in VECTOR_DB_DIR.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+    
+    vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings_model,
-        persist_directory=CHROMA_DB_DIRECTORY # A persistência é tratada aqui.
+        persist_directory=str(VECTOR_DB_DIR)
     )
-    # REMOVIDO: vector_store.persist() # Esta linha causava o AttributeError
-
-    print("DEBUG: ChromaDB populado e persistido com sucesso.", flush=True)
-    
-    final_chunk_count = len(vector_store.get(include=['metadatas'])['metadatas'])
-    print(f"RESULT: Número final de chunks persistidos no ChromaDB: {final_chunk_count}", flush=True)
-    print("--- Construção da base de conhecimento finalizada ---", flush=True)
+    vectorstore.persist()
+    print("ChromaDB population complete. Knowledge base is ready!")
 
 if __name__ == "__main__":
     build_knowledge_base()
