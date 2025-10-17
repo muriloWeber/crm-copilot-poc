@@ -1,165 +1,147 @@
+# src/data_ingestion/knowledge_base_builder.py
+
 import os
 import re
-import shutil
-import pathlib
-from typing import List, Dict, Any
-
-from langchain_community.document_loaders import UnstructuredFileLoader
+import sys
+import glob
+from pathlib import Path
+import chardet
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_openai import OpenAIEmbeddings
-from langchain_core.documents import Document
+from langchain_chroma import Chroma
 from dotenv import load_dotenv
+import httpx
+from chromadb.utils import embedding_functions
+from langchain_core.documents import Document
 
-# Carrega variáveis de ambiente (como OPENAI_API_KEY)
+# Carrega as variáveis de ambiente do .env
 load_dotenv()
 
 # --- Configurações ---
-# Diretório onde os documentos crus (PDF, DOCX, TXT) estão localizados
-RAW_DOCS_DIR = pathlib.Path("data/raw_documents")
-# Diretório onde o banco de vetores Chroma será armazenado
-VECTOR_DB_DIR = pathlib.Path("data/vector_db/chroma_db")
+DATA_DIR = Path("data")
+RAW_DOCUMENTS_DIR = DATA_DIR / "raw_documents"
+VECTOR_DB_DIR = DATA_DIR / "vector_db" / "chroma_db"
+CHROMA_COLLECTION_NAME = 'tcrm_copilot_kb' 
+EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
+CHUNK_SIZE = 250
+CHUNK_OVERLAP = 50
 
-# Tamanho de cada pedaço de texto (chunk) para o LLM
-CHUNK_SIZE = 1000
-# Sobreposição entre chunks para manter o contexto
-CHUNK_OVERLAP = 200
-# Modelo de embedding da OpenAI
-EMBEDDING_MODEL = "text-embedding-ada-002"
+# Garante que os diretórios existam
+RAW_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+VECTOR_DB_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Funções de Ajuda ---
+# Inicializa o modelo de Embeddings da OpenAI
+# Configura o cliente HTTP para ignorar a verificação SSL, essencial para o proxy da TOTVS
+custom_http_client = httpx.Client(verify=False)
 
-def extract_metadata_from_document_content(doc_content: str, filename: str) -> Dict[str, str]:
-    """
-    Extrai o nome do cliente e o código do projeto do conteúdo do documento
-    com maior precisão, priorizando o nome do arquivo para o cliente.
-    """
-    client_name = "Unknown Client"
-    project_code = "Unknown Project Code"
+embeddings_model = OpenAIEmbeddings(
+    model=EMBEDDING_MODEL_NAME,
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_API_BASE"),
+    http_client=custom_http_client
+)
 
-    # 1. EXTRAÇÃO DO NOME DO CLIENTE: Prioridade máxima para o nome do arquivo
-    # Ex: "[KION] - Escopo Técnico..." -> "KION"
-    filename_client_match = re.match(r"\[(.*?)\]", filename)
-    if filename_client_match:
-        client_name = filename_client_match.group(1).strip()
-    # NUNCA sobrescrever o client_name se encontrado no nome do arquivo.
-
-    # 2. EXTRAÇÃO DO CÓDIGO DO PROJETO: Buscar no conteúdo, com regex mais específica
-    # Ex: "Código do Projeto: D000071597001" -> "D000071597001"
-    project_code_match = re.search(
-        r"Código do Projeto:\s*(D\d{9,15}|\w{3}\d{3})", # Captura "D" + dígitos (pelo menos 9) OU "MIT" + 3 dígitos
-        doc_content, re.IGNORECASE
-    )
-    if project_code_match:
-        project_code = project_code_match.group(1).strip()
-    
-    # Fallback para o código do projeto (se não encontrado no conteúdo, talvez MIT041 no nome do arquivo)
-    if project_code == "Unknown Project Code" or not project_code:
-        mit_match = re.search(r"(MIT\d{3})", filename, re.IGNORECASE)
-        if mit_match:
-            project_code = mit_match.group(1).strip() # Ex: MIT041
+# Inicializa o ChromaDB
+# Excluímos o parametro client_settings pois ele interfere no funcionamento em alguns SO's
+# db = Chroma(persist_directory=str(VECTOR_DB_DIR), embedding_function=embeddings_model)
 
 
-    return {
-        "client_name": client_name,
-        "project_code": project_code,
-        "original_filename": filename
-    }
-
-def load_documents_with_enriched_metadata(directory: pathlib.Path) -> List[Document]:
-    """
-    Carrega documentos de um diretório, extrai metadados do conteúdo
-    e os adiciona ao objeto Document.
-    """
+def load_and_chunk_documents():
     documents = []
-    for filepath in directory.iterdir():
-        if filepath.is_file() and filepath.suffix in [".pdf", ".docx", ".txt"]:
-            print(f"Loading and extracting metadata from: {filepath.name}")
-            try:
-                # Carrega o documento, focando no conteúdo para extração de metadados
-                loader = UnstructuredFileLoader(str(filepath), mode="elements")
-                
-                # O UnstructuredFileLoader pode retornar múltiplos elementos,
-                # vamos tentar pegar o texto completo para extração de metadados.
-                raw_docs_elements = loader.load()
-                full_content = "\n".join([doc.page_content for doc in raw_docs_elements])
-
-                # Extrai metadados personalizados
-                custom_metadata = extract_metadata_from_document_content(full_content, filepath.name)
-
-                # Criamos um único Documento para o arquivo completo, com os metadados.
-                # O text_splitter irá quebrar este Documento em chunks,
-                # e os metadados serão propagados.
-                doc = Document(
-                    page_content=full_content,
-                    metadata={
-                        "source": str(filepath),
-                        **custom_metadata # Adiciona os metadados customizados aqui
-                    }
-                )
-                documents.append(doc)
-                print(f"  -> Extracted Client: '{custom_metadata['client_name']}', Project Code: '{custom_metadata['project_code']}'")
-
-            except Exception as e:
-                print(f"Error loading or processing {filepath.name}: {e}")
-    return documents
-
-# --- Pipeline de Construção da Base de Conhecimento ---
-
-def build_knowledge_base():
-    """
-    Constrói (ou reconstrói) a base de conhecimento (ChromaDB)
-    a partir dos documentos brutos.
-    """
-    print(f"Starting knowledge base construction...")
-
-    # 1. Carregar documentos e extrair metadados enriquecidos
-    print(f"Loading documents from {RAW_DOCS_DIR}...")
-    documents = load_documents_with_enriched_metadata(RAW_DOCS_DIR)
-    if not documents:
-        print("No documents found or processed. Exiting.")
-        return
-
-    # 2. Dividir documentos em chunks
-    print(f"Splitting {len(documents)} document(s) into chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})...")
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         length_function=len,
         add_start_index=True,
     )
-    # A atenção aqui: `create_documents` ou `split_documents` da LangChain
-    # irá manter os metadados do documento original em cada chunk.
-    chunks = text_splitter.split_documents(documents)
-    print(f"Created {len(chunks)} chunks.")
 
-    # 3. Gerar embeddings
-    print(f"Initializing OpenAI embeddings with model '{EMBEDDING_MODEL}'...")
-    embeddings_model = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    for file_path_obj in RAW_DOCUMENTS_DIR.iterdir():
+        file_path = str(file_path_obj)
+        filename = file_path_obj.name
+        print(f"Processando documento: {filename}")
 
-    # 4. Popular ChromaDB
-    print(f"Populating ChromaDB at {VECTOR_DB_DIR}...")
-    
-    # Garante que o diretório do ChromaDB existe
-    VECTOR_DB_DIR.mkdir(parents=True, exist_ok=True)
+        loader = None
+        if filename.endswith(".pdf"):
+            loader = PyPDFLoader(file_path)
+        elif filename.endswith(".docx"):
+            loader = Docx2txtLoader(file_path)
+        elif filename.endswith(".txt"):
+            # Para TXT, detecta a codificação para evitar erros
+            with open(file_path, 'rb') as f:
+                raw_data = f.read()
+                result = chardet.detect(raw_data)
+                encoding = result['encoding'] if result['encoding'] else 'utf-8' # Fallback para utf-8
 
-    # Remove o conteúdo existente para reconstruir (opcional, mas bom para testes iniciais)
-    # Cuidado: shuta o balde!
-    if VECTOR_DB_DIR.exists() and any(VECTOR_DB_DIR.iterdir()):
-        print(f"  -> Existing ChromaDB detected. Deleting content for fresh build.")
-        for item in VECTOR_DB_DIR.iterdir():
-            if item.is_file():
-                item.unlink()
-            elif item.is_dir():
-                shutil.rmtree(item)
-    
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings_model,
-        persist_directory=str(VECTOR_DB_DIR)
-    )
-    vectorstore.persist()
-    print("ChromaDB population complete. Knowledge base is ready!")
+            loader = TextLoader(file_path, encoding=encoding)
+        else:
+            print(f"Tipo de arquivo não suportado, pulando: {filename}")
+            continue
+
+        try:
+            # Carrega o conteúdo do documento
+            doc_content = "".join([page.page_content for page in loader.load()])
+
+            # MODIFICAÇÃO: Extrai client_name e doc_type do filename ou content
+            client_name_match = re.search(r'\[([A-Za-z0-9_\s]+)\]', filename)
+            # Prioriza o nome dentro de colchetes, se não encontrar, tenta por heurística simples ou Unknown
+            client_name = client_name_match.group(1).strip() if client_name_match else 'Unknown Client'
+            
+            # === REMOÇÃO DO HARDCODING 'Scens' NO knowledge_base_builder.py ===
+            # AGORA, TODOS OS NOMES DE CLIENTE VÁLIDOS SÃO PADRONIZADOS PARA UPPERCASE NO METADADO.
+            if client_name != 'Unknown Client':
+                client_name = client_name.upper() 
+            # ======================================================================
+
+            doc_type_match = re.search(r'(MIT\d{3})', filename, re.IGNORECASE)
+            doc_type = doc_type_match.group(1).upper() if doc_type_match else 'Generic Doc'
+
+            # MODIFICAÇÃO: Extrai project_code. Para PoC, o da KION é o mais evidente no nome.
+            # O da Marson está no content, mas não no nome, dificultando extrair só do nome.
+            project_code_match = re.search(r'Código do Projeto: (D\d{9,15})', doc_content)
+            project_code = project_code_match.group(1).strip() if project_code_match else 'Unknown Project'
+
+            # Cria chunks e adiciona metadados enriquecidos
+            chunks = text_splitter.split_text(doc_content)
+            
+            for i, chunk_content in enumerate(chunks):
+                metadata = {
+                    "source": os.path.join("data", "raw_documents", filename), # Caminho relativo
+                    "original_filename": filename,
+                    "client_name": client_name, # MODIFICAÇÃO: Metadado client_name
+                    "doc_type": doc_type,       # MODIFICAÇÃO: Metadado doc_type
+                    "project_code": project_code, # MODIFICAÇÃO: Metadado project_code
+                    "chunk_number": i + 1
+                }
+                documents.append(Document(page_content=chunk_content, metadata=metadata))
+
+        except Exception as e:
+            print(f"Erro ao processar {filename}: {e}")
+
+    return documents
+
 
 if __name__ == "__main__":
-    build_knowledge_base()
+    print("Iniciando a ingestão de documentos para o ChromaDB...")
+    
+    # Remove a pasta do ChromaDB existente para garantir uma reconstrução limpa
+    if VECTOR_DB_DIR.exists():
+        import shutil
+        shutil.rmtree(VECTOR_DB_DIR)
+        print(f"Diretório ChromaDB existente '{VECTOR_DB_DIR}' removido para reconstrução.")
+
+    docs_to_ingest = load_and_chunk_documents()
+
+    if docs_to_ingest:
+        print(f"Total de {len(docs_to_ingest)} chunks preparados para ingestão.")
+        # Cria a nova base de dados no ChromaDB
+        db = Chroma.from_documents(
+            docs_to_ingest,
+            embeddings_model,
+            persist_directory=str(VECTOR_DB_DIR),
+            collection_name=CHROMA_COLLECTION_NAME 
+        )
+        print("Ingestão concluída e ChromaDB persistido.")
+    else:
+        print("Nenhum documento para ingestão. Verifique a pasta 'data/raw_documents'.")
+

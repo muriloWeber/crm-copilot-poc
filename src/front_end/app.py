@@ -2,6 +2,11 @@
 
 import sys
 import os
+import streamlit as st
+import time
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, AIMessage # <--- NOVA IMPORTAÇÃO AQUI
+from langgraph.graph import StateGraph, END
 
 # Adiciona a raiz do projeto ao sys.path para que o Python encontre o pacote 'src'
 # independentemente de como o Streamlit é executado.
@@ -9,15 +14,9 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 if project_root not in sys.path:
     sys.path.insert(0, project_root) # Insere no início para dar prioridade
 
-
-from dotenv import load_dotenv # Importar load_dotenv
-import streamlit as st
-import time # Já deve estar aí, mas mantendo para visibilidade
-
 # --- Importar as definições do agente que criamos ---
 # Estes imports agora funcionarão porque a raiz do projeto está no sys.path
-from src.core.copilot_agent import AgentState, retrieve_context_node, generate_response_node, format_citation_node, get_llm
-from langgraph.graph import StateGraph, END # Importar StateGraph e END
+from src.core.copilot_agent import AgentState, retrieve_context_node, generate_response_node, format_citation_node
 
 # Carrega as variáveis do .env no início do script
 load_dotenv()
@@ -42,8 +41,6 @@ def create_agent_workflow():
 # Certifique-se que o build_knowledge_base já foi executado!
 try:
     copilot_agent = create_agent_workflow()
-    # Não é necessário chamar get_llm() aqui se o copilot_agent já está compilado com ele
-    # e não precisamos do objeto LLM diretamente para a UI.
     st.session_state.llm_initialized = True
 except Exception as e:
     st.error(f"Erro ao inicializar o Copilot: {e}. Certifique-se de que a base de conhecimento foi construída e as variáveis de ambiente estão corretas.")
@@ -51,7 +48,7 @@ except Exception as e:
 
 
 # --- TCRM Copilot Streamlit UI ---
-st.set_page_config(page_title="TCRM Copilot", page_icon="🤖")
+st.set_page_config(page_title="TCRM Copilot", page_icon="��")
 
 st.title("🤖 TCRM Copilot")
 st.markdown("Seu assistente de IA para projetos TOTVS CRM.")
@@ -88,9 +85,26 @@ if prompt := st.chat_input("Pergunte ao Copilot sobre seu projeto..."):
         agent_final_response_content = ""
 
         try:
+            # --- CONVERSÃO DAS MENSAGENS E ESTADO INICIAL COMPLETO (PONTO CRÍTICO CORRIGIDO!) ---
+            lc_messages = []
+            for msg in st.session_state.messages:
+                if msg["role"] == "user":
+                    lc_messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    lc_messages.append(AIMessage(content=msg["content"]))
+
+            # Prepare initial state for the agent, ensuring all AgentState fields are initialized
+            initial_agent_state = AgentState(
+                question=prompt,
+                context=[],         # Será populado por retrieve_context_node
+                source_docs=[],     # Será populado por retrieve_context_node
+                answer="",          # Será populado por generate_response_node
+                messages=lc_messages, # Mensagens convertidas para o formato LangChain
+                filters={}          # Inicializado como dicionário vazio
+            )
+
             # Invocar o agente LangGraph
-            inputs = {"question": prompt, "messages": st.session_state.messages} # Adiciona o histórico para contexto
-            response = copilot_agent.invoke(inputs)
+            response = copilot_agent.invoke(initial_agent_state) # <--- Passando o estado inicial completo
             
             # A resposta final formatada já deve estar em response['answer']
             agent_final_response_content = response.get("answer", "Não consegui gerar uma resposta para isso. Tente refazer a pergunta ou fornecer mais contexto.")
