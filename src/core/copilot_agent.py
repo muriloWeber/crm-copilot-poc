@@ -3,7 +3,7 @@ import os
 import re
 import sys
 import pathlib
-from typing import TypedDict, List, Optional, Any, Dict 
+from typing import TypedDict, List, Optional, Any, Dict, Set
 from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -18,9 +18,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Constantes de Configuração (Devem ser as mesmas do knowledge_base_builder.py) ---
-# Caminho para o diretório do ChromaDB, ALINHADO com knowledge_base_builder.py
 CHROMA_DB_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'vector_db', 'chroma_db'))
-CHROMA_COLLECTION_NAME = 'tcrm_copilot_kb' # <--- DEFINIÇÃO DO NOME DA COLEÇÃO
+CHROMA_COLLECTION_NAME = 'tcrm_copilot_kb'
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
 
 # --- 1. Definição do AgentState ---
@@ -43,7 +42,6 @@ class AgentState(TypedDict):
 
 # --- 2. Configurações e Inicialização do LLM e Embeddings/Vector Store ---
 
-# Inicializa o LLM
 def get_llm():
     openai_api_key = os.getenv("OPENAI_API_KEY")
     openai_api_base = os.getenv("OPENAI_API_BASE")
@@ -55,17 +53,15 @@ def get_llm():
     custom_http_client = httpx.Client(verify=False)
 
     return ChatOpenAI(
-        model="gpt-4o-mini", # Ou qualquer outro modelo GPT que você queira usar
+        model="gpt-4o-mini",
         openai_api_key=openai_api_key,
         base_url=openai_api_base if openai_api_base else None,
-        temperature=0,       # Menor temperatura para respostas mais determinísticas
+        temperature=0,
         http_client=custom_http_client
     )
 
-# Instância global do LLM para uso pelos nós
 llm = get_llm()
 
-# Inicializa o modelo de Embeddings
 def get_embeddings_model():
     openai_api_key = os.getenv("OPENAI_API_KEY")
     openai_api_base = os.getenv("OPENAI_API_BASE")
@@ -82,107 +78,117 @@ def get_embeddings_model():
         http_client=custom_http_client
     )
 
-# Instância global do modelo de embeddings
 embeddings_model = get_embeddings_model()
 
-# Carrega o ChromaDB persistido
-_vector_store: Optional[Chroma] = None # Variável privada para armazenar a instância do vector store
+_vector_store: Optional[Chroma] = None
 
 def get_vector_store() -> Chroma:
     global _vector_store
     if _vector_store is None:
         if not os.path.exists(CHROMA_DB_DIRECTORY):
-            # Levanta um erro claro se o diretório do DB não existir
             raise FileNotFoundError(f"ChromaDB directory not found at {CHROMA_DB_DIRECTORY}. "
                                     "Please run src/data_ingestion/knowledge_base_builder.py first.")
-        # Se o diretório existe, carrega o ChromaDB
         _vector_store = Chroma(
             persist_directory=CHROMA_DB_DIRECTORY, 
             embedding_function=embeddings_model,
-            collection_name=CHROMA_COLLECTION_NAME # <--- USANDO O NOME DA COLEÇÃO
+            collection_name=CHROMA_COLLECTION_NAME
         )
         print(f"DEBUG: ChromaDB carregado de {CHROMA_DB_DIRECTORY} com coleção '{CHROMA_COLLECTION_NAME}'.", file=sys.stderr)
     return _vector_store
 
-# Tenta carregar o vector store na inicialização do módulo.
-# Se falhar (DB ainda não construído), _vector_store permanecerá None,
-# e o erro será tratado em retrieve_context_node.
 try:
     _vector_store = get_vector_store()
 except FileNotFoundError as e:
     print(f"WARNING: {e}. O Copilot pode não funcionar corretamente até que a base de conhecimento seja construída.", file=sys.stderr)
-    _vector_store = None # Garante que a variável está None se a carga falhar
+    _vector_store = None
+
+# --- FUNÇÃO PARA CARREGAR NOMES DE CLIENTES DINAMICAMENTE DO CHROMADB ---
+_known_client_names: Set[str] = set()
+
+def _load_known_client_names_from_chroma():
+    global _known_client_names
+    if _vector_store:
+        print("DEBUG: Carregando nomes de clientes conhecidos do ChromaDB...")
+        try:
+            # Acessa o cliente ChromaDB subjacente para maior controle
+            chroma_client = _vector_store._client
+            collection = chroma_client.get_or_create_collection(name=CHROMA_COLLECTION_NAME)
+            
+            # Obtém a contagem de documentos na coleção
+            count = collection.count()
+            
+            if count == 0:
+                print("DEBUG: Coleção ChromaDB vazia. Nenhum cliente para carregar.")
+                _known_client_names = set()
+                return
+
+            # Obtém todos os metadados da coleção
+            # Usamos limit=count para buscar todos os documentos existentes.
+            # O `where` é omitido, mas a chamada `get` do cliente direto é mais tolerante.
+            results = collection.get(
+                limit=count, # Tenta pegar todos os documentos
+                include=['metadatas']
+            )
+            
+            unique_clients = set()
+            for metadata_dict in results.get('metadatas', []):
+                client_name = metadata_dict.get('client_name')
+                # Filtra valores None, strings vazias e 'Unknown Client' em Python.
+                if client_name and client_name.strip() and client_name.upper() != "UNKNOWN CLIENT":
+                    unique_clients.add(client_name.upper()) # Garante que sejam todos em UPPERCASE
+            _known_client_names = unique_clients
+            print(f"DEBUG: Nomes de clientes carregados: {_known_client_names}")
+        except Exception as e:
+            print(f"ERROR: Falha ao carregar nomes de clientes do ChromaDB: {e}. "
+                  f"Verifique a integridade da sua base ChromaDB ou os metadados.", file=sys.stderr)
+            _known_client_names = set() # Define como vazio em caso de erro
+    else:
+        print("DEBUG: ChromaDB não carregado. Não foi possível carregar nomes de clientes.")
+
+# Carrega os nomes dos clientes na inicialização do módulo, se o vector store estiver disponível
+if _vector_store:
+    _load_known_client_names_from_chroma()
 
 
-# --- FUNÇÃO DE DETECÇÃO DE CLIENTE/PROJETO/DOC_TYPE (REVISADA E NÃO HARDCODED) ---
+# --- FUNÇÃO DE DETECÇÃO DE CLIENTE/PROJETO/DOC_TYPE (AGORA USA A LISTA DINÂMICA) ---
 def _detect_client_or_project_in_question(question: str) -> Dict[str, str]:
     """
     Detecta se um nome de cliente, código de projeto ou tipo de documento está presente na pergunta do usuário.
-    Retorna um dicionário com os filtros detectados, alinhados aos metadados (agora todos em UPPERCASE).
+    Prioriza a busca por nomes de clientes conhecidos carregados dinamicamente do ChromaDB.
+    Retorna um dicionário com os filtros detectados, alinhados aos metadados (todos em UPPERCASE).
     """
     detected_filters = {}
     question_lower = question.lower()
+    print(f"DEBUG (Detector): Questão recebida: '{question}'")
 
-    # Define uma lista abrangente de palavras comuns em português para exclusão.
-    # Esta lista *NÃO* contém nomes de clientes, mas elementos linguísticos comuns.
-    # É crucial para evitar falsos positivos como "Quais", "O", "De", etc.
-    COMMON_PORTUGUESE_EXCLUSIONS = {
-        "A", "AS", "O", "OS", "E", "DE", "DO", "DA", "DOS", "DAS", "UM", "UMA", "UNS", "UMAS",
-        "EM", "NO", "NA", "NOS", "NAS", "POR", "PELO", "PELA", "PELOS", "PELAS", "COM", "SEM", "PARA",
-        "QUAL", "QUAIS", "QUEM", "QUE", "COMO", "ONDE", "QUANDO", "PORQUE", "PRA", "PRO", "PRAS", "PROS",
-        "SOBRE", "FALE", "ME", "SOBRE", "EXPLIQUE", "DETALHE", "DISCUTA", "APRESENTE", "MOSTRAR", "VER",
-        "PROJETO", "DOCUMENTO", "ARQUIVO", "INFORMAÇÕES", "DADOS", "ESCOPO", "CONSIDERAÇÕES", "FINAIS",
-        "OBJETIVO", "HISTÓRICO", "VERSÃO", "AMBIENTAÇÃO", "SUMÁRIO", "DEFINIÇÃO", "MÓDULOS", "ADICIONAIS",
-        "PREMISSAS", "NEGÓCIO", "SOLUÇÃO", "SISTEMA", "SOFTWARE", "APLICAÇÃO", "PLATAFORMA", "INTEGRAÇÃO",
-        "API", "APIS", "CLIENTE", "ID", "IDS", "LICENÇAS", "QUANTAS", "CONTRATADAS", "MIT", # "MIT" é um tipo de documento, não um cliente
-        "CRM", "TOTVS", "ERP", "DATASUL", "PROTHEUS", "BX", "POC", "COPILOT" # Outros termos comuns do domínio
-    }
+    # 1. Detecção de Nome de Cliente (usando a lista dinâmica de _known_client_names)
+    # Esta é a forma mais robusta e dinâmica.
+    if _known_client_names: # Certifica-se de que a lista foi carregada
+        for client_name in _known_client_names:
+            # Usar word boundaries (\b) para evitar falsos positivos (ex: "SCENS" em "ASCENSO").
+            # re.escape() para tratar caracteres especiais em nomes de clientes, se houver.
+            if re.search(r'\b' + re.escape(client_name.lower()) + r'\b', question_lower):
+                detected_filters["client_name"] = client_name # Já está em UPPERCASE
+                print(f"DEBUG (Detector): Cliente detectado por lista de nomes conhecidos: '{detected_filters['client_name']}'")
+                break # Encontrou um cliente, não precisa procurar mais
+            else:
+                print(f"DEBUG (Detector): Cliente '{client_name}' não encontrado na questão (busca direta).")
+    else:
+        print("DEBUG (Detector): _known_client_names não carregada ou vazia. Não foi possível usar a detecção dinâmica de clientes.")
 
-    # 1. Detecção de nome de cliente entre colchetes (prioridade máxima, alta confiança)
-    # Ex: "[KION]", "[SCENS]"
-    bracket_match = re.search(r'\[([A-Z0-9\s-]+)\]', question, re.IGNORECASE)
-    if bracket_match:
-        # Pega o conteúdo dentro dos colchetes, remove espaços extras e converte para UPPER
-        # AGORA VAI CORRESPONDER DIRETAMENTE AOS METADADOS EM UPPERCASE.
-        client_name_candidate = bracket_match.group(1).strip().upper() 
-        detected_filters["client_name"] = client_name_candidate
-        print(f"DEBUG: Cliente detectado por colchetes: '{detected_filters['client_name']}'")
-        
-    # 2. Se não encontrou colchetes, tenta detectar nomes capitalizados não excluídos
-    # Este é um fallback mais heurístico, mas com uma lista de exclusão mais robusta.
-    if "client_name" not in detected_filters:
-        # Busca por palavras que começam com maiúscula (ou são todas maiúsculas),
-        # permitindo múltiplos termos em nomes compostos (ex: "SOUTH AMERICA").
-        potential_client_candidates = re.findall(r'\b[A-Z][A-Z0-9]*(?:[\s-][A-Z][A-Z0-9]*)*\b', question)
-        
-        for candidate in potential_client_candidates:
-            candidate_upper = candidate.upper()
-            
-            # Filtra por tamanho mínimo para evitar siglas indesejadas,
-            # mas permite "ID" ou "MIT" se necessário para outros filtros.
-            if len(candidate_upper) < 3 and candidate_upper not in {"ID", "MIT"}:
-                continue
-            
-            # Se o candidato não está na lista de exclusão E não se parece com um código de projeto/documento.
-            if candidate_upper not in COMMON_PORTUGUESE_EXCLUSIONS:
-                if not re.fullmatch(r"D\d{9,15}", candidate_upper) and not re.fullmatch(r"MIT\d{3}", candidate_upper):
-                    # AGORA VAI CORRESPONDER DIRETAMENTE AOS METADADOS EM UPPERCASE.
-                    detected_filters["client_name"] = candidate.strip().upper() 
-                    print(f"DEBUG: Cliente detectado por capitalização e exclusão: '{detected_filters['client_name']}'")
-                    break # Assume apenas um nome de cliente por pergunta para simplificar a PoC
-
-    # --- Detecção de Código de Projeto (D + dígitos) ---
+    # 2. Detecção de Código de Projeto (D + dígitos)
     project_code_match_d = re.search(r"D\d{9,15}", question, re.IGNORECASE)
     if project_code_match_d:
         detected_filters["project_code"] = project_code_match_d.group(0).upper()
-        print(f"DEBUG: Código de Projeto detectado: '{detected_filters['project_code']}'")
+        print(f"DEBUG (Detector): Código de Projeto detectado: '{detected_filters['project_code']}'")
 
-    # --- Detecção de Tipo de Documento (MIT + 3 dígitos) ---
+    # 3. Detecção de Tipo de Documento (MIT + 3 dígitos)
     doc_type_match = re.search(r"(MIT\d{3})", question, re.IGNORECASE)
     if doc_type_match:
         detected_filters["doc_type"] = doc_type_match.group(1).upper()
-        print(f"DEBUG: Tipo de Documento detectado: '{detected_filters['doc_type']}'")
+        print(f"DEBUG (Detector): Tipo de Documento detectado: '{detected_filters['doc_type']}'")
 
+    print(f"DEBUG (Detector): Filtros finais detectados: {detected_filters}")
     return detected_filters
 
 
@@ -192,6 +198,7 @@ def retrieve_context_node(state: AgentState):
     """
     Nó para recuperar chunks relevantes da base de conhecimento.
     Recebe a pergunta do usuário e quaisquer filtros ativos do estado do agente.
+    Adicionado log detalhado dos chunks recuperados para depuração.
     """
     global _vector_store
 
@@ -207,25 +214,25 @@ def retrieve_context_node(state: AgentState):
     
     # Detecta filtros da pergunta atual
     detected_filters_from_question = _detect_client_or_project_in_question(question)
+    print(f"DEBUG: Filtros detectados da pergunta: {detected_filters_from_question}") # Log adicional aqui
     
     # Prepara os filtros para o ChromaDB usando a sintaxe de $and para múltiplos
     chroma_filter_conditions = []
     
     if "client_name" in detected_filters_from_question:
         client_name = detected_filters_from_question["client_name"]
-        # O nome do cliente detectado (já em UPPER) é usado diretamente, pois os metadados também estão em UPPER.
         chroma_filter_conditions.append({"client_name": client_name}) 
-        print(f"  -> Filtro de cliente detectado: '{client_name}'")
+        print(f"  -> Filtro de cliente DETECTADO para ChromaDB: '{client_name}'") # Log adicional aqui
     
     if "project_code" in detected_filters_from_question:
         project_code = detected_filters_from_question["project_code"]
         chroma_filter_conditions.append({"project_code": project_code})
-        print(f"  -> Filtro de código de projeto detectado: '{project_code}'")
+        print(f"  -> Filtro de código de projeto DETECTADO para ChromaDB: '{project_code}'") # Log adicional aqui
 
     if "doc_type" in detected_filters_from_question:
         doc_type = detected_filters_from_question["doc_type"]
         chroma_filter_conditions.append({"doc_type": doc_type})
-        print(f"  -> Filtro de tipo de documento detectado: '{doc_type}'")
+        print(f"  -> Filtro de tipo de documento DETECTADO para ChromaDB: '{doc_type}'") # Log adicional aqui
 
     # =====================================================================
     # >>>>> USANDO as_retriever COM search_kwargs PARA FILTRAGEM <<<<<
@@ -250,34 +257,42 @@ def retrieve_context_node(state: AgentState):
     
     # =====================================================================
     
-    print(f"DEBUG: {len(retrieved_docs)} chunks recuperados. Conteúdo dos chunks:")
+    # --- LOG DETALHADO PARA DIAGNÓSTICO DO FILTRO ---
+    print(f"DEBUG: {len(retrieved_docs)} chunks RECUPERADOS APÓS APLICAÇÃO DE FILTRO. Verificando metadados:\n")
     if not retrieved_docs:
-        print("DEBUG: Nenhuma informação relevante foi recuperada.")
+        print("DEBUG: Nenhuma informação relevante foi recuperada após filtragem.\n")
     
-    # === CORREÇÃO: Inicialização e preenchimento de source_docs_metadata ===
-    source_docs_metadata = [] # <--- Variável inicializada aqui!
+    source_docs_metadata = [] # Variável inicializada aqui!
     for i, doc in enumerate(retrieved_docs):
+        retrieved_client_name = doc.metadata.get('client_name', 'N/A')
+        retrieved_original_filename = doc.metadata.get('original_filename', 'N/A')
+        retrieved_doc_type = doc.metadata.get('doc_type', 'N/A') # Adicionar tipo de documento
+
         print(f"--- Chunk {i+1} ---")
-        print(f"Source: {doc.metadata.get('source', 'N/A')}")
-        print(f"Original Filename: {doc.metadata.get('original_filename', 'N/A')}")
-        print(f"Client Name: {doc.metadata.get('client_name', 'N/A')}")
-        print(f"Doc Type: {doc.metadata.get('doc_type', 'N/A')}") 
-        print(f"Project Code: {doc.metadata.get('project_code', 'N/A')}")
-        print(f"Page Content (primeiros 300 chars): {doc.page_content[:300]}...")
-        print(f"--- Fim Chunk {i+1} ---")
+        print(f"  Client Name: {retrieved_client_name}")
+        print(f"  Doc Type: {retrieved_doc_type}")
+        print(f"  Original Filename: {retrieved_original_filename}")
+        print(f"  Page Content (primeiros 150 chars): {doc.page_content[:150]}...")
+        
+        # Alerta se um chunk não corresponder ao cliente esperado
+        expected_client = detected_filters_from_question.get('client_name')
+        if expected_client and retrieved_client_name != expected_client:
+            print(f"  !!! ALERTA: chunk {i+1} é do cliente '{retrieved_client_name}' e NÃO CORRESPONDE ao cliente esperado '{expected_client}' !!!")
+        
+        print(f"--- Fim Chunk {i+1} ---\n") # Adicionado \n para melhor legibilidade no console
 
         # Preenchendo source_docs_metadata para uso posterior na citação
         source_docs_metadata.append({
             "source": doc.metadata.get('source', 'N/A'),
-            "document_id": doc.metadata.get('original_filename', 'N/A'),
-            "client_name": doc.metadata.get('client_name', 'N/A'),
-            "doc_type": doc.metadata.get('doc_type', 'N/A'),
+            "document_id": retrieved_original_filename,
+            "client_name": retrieved_client_name,
+            "doc_type": retrieved_doc_type,
             "project_code_crm": doc.metadata.get('project_code', 'N/A'),
             "page_content": doc.page_content 
         })
-    # ====================================================================
+    # --- FIM LOG DETALHADO ---
 
-    print(f"DEBUG: {len(retrieved_docs)} chunks recuperados.")
+    print(f"DEBUG: {len(retrieved_docs)} chunks recuperados para o LLM.\n") # Adicionado \n para melhor legibilidade no console
     return {"context": retrieved_docs, "source_docs": source_docs_metadata, "filters": detected_filters_from_question}
 
 
@@ -351,12 +366,17 @@ def format_citation_node(state: AgentState):
     extracted_numbers = re.findall(r'\d+', answer)
     
     relevant_keywords = []
+    # Adicionado mais palavras-chave para melhor detecção da citação
     if "licenças" in answer.lower():
         relevant_keywords.append("licenças")
     if "ids" in answer.lower():
         relevant_keywords.append("ids")
     if "contratadas" in answer.lower():
         relevant_keywords.append("contratadas")
+    if "personalizações" in answer.lower():
+        relevant_keywords.append("personalizações")
+    if "campos" in answer.lower():
+        relevant_keywords.append("campos")
     
     for doc_meta in all_source_docs:
         current_snippet = doc_meta.get('page_content', '').strip()
@@ -364,17 +384,24 @@ def format_citation_node(state: AgentState):
 
         is_strong_match = False
         
+        # Lógica de correspondência de citação aprimorada
         if relevant_keywords and extracted_numbers:
              if any(kw in current_snippet_lower for kw in relevant_keywords) and \
                 any(num in current_snippet for num in extracted_numbers):
                  is_strong_match = True
-        elif relevant_keywords and not extracted_numbers: # Se não achou número, mas achou keywords
+        elif relevant_keywords and not extracted_numbers:
             if any(kw in current_snippet_lower for kw in relevant_keywords):
                 is_strong_match = True
-        elif extracted_numbers and not relevant_keywords: # Se achou número, mas não keywords
+        elif extracted_numbers and not relevant_keywords:
             if any(num in current_snippet for num in extracted_numbers):
                 is_strong_match = True
         
+        # Também verifica se a resposta gerada está contida no snippet (match mais direto)
+        # Atenção: LLMs podem parafrasear, então o match exato pode falhar.
+        # Mas para snippets curtos de fatos, é útil.
+        if answer.lower() in current_snippet_lower:
+            is_strong_match = True
+
         if is_strong_match:
             selected_doc_meta_for_citation = doc_meta
             snippet_to_cite = current_snippet
@@ -382,6 +409,7 @@ def format_citation_node(state: AgentState):
             break
 
     if selected_doc_meta_for_citation is None and all_source_docs:
+        # Fallback para o primeiro chunk se nenhum match forte for encontrado
         selected_doc_meta_for_citation = all_source_docs[0]
         snippet_to_cite = selected_doc_meta_for_citation.get('page_content', '').strip()
         print("DEBUG: Nenhuma citação 'exata' encontrada, usando o chunk mais similar como fallback.")
@@ -397,8 +425,9 @@ def format_citation_node(state: AgentState):
             f"Código Projeto CRM: {selected_doc_meta_for_citation.get('project_code_crm', 'N/A')})"
         ]
         if snippet_to_cite:
-            if len(snippet_to_cite) > 300:
-                snippet_to_cite = snippet_to_cite[:300] + "..."
+            # Garante que o snippet exibido não seja excessivamente longo
+            if len(snippet_to_cite) > 500: # Aumentado o limite para capturar mais contexto
+                snippet_to_cite = snippet_to_cite[:500] + "..."
             citation_parts.append(f"'{snippet_to_cite}'")
         final_citation_entry = "\n".join(citation_parts)
 
