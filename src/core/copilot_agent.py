@@ -123,8 +123,6 @@ def _load_known_client_names_from_chroma():
                 return
 
             # Obtém todos os metadados da coleção
-            # Usamos limit=count para buscar todos os documentos existentes.
-            # O `where` é omitido, mas a chamada `get` do cliente direto é mais tolerante.
             results = collection.get(
                 limit=count, # Tenta pegar todos os documentos
                 include=['metadatas']
@@ -150,7 +148,7 @@ if _vector_store:
     _load_known_client_names_from_chroma()
 
 
-# --- FUNÇÃO DE DETECÇÃO DE CLIENTE/PROJETO/DOC_TYPE (AGORA USA A LISTA DINÂMICA) ---
+# --- FUNÇÃO DE DETECÇÃO DE CLIENTE/PROJETO/DOC_TYPE OTIMIZADA E COM FALLBACK ---
 def _detect_client_or_project_in_question(question: str) -> Dict[str, str]:
     """
     Detecta se um nome de cliente, código de projeto ou tipo de documento está presente na pergunta do usuário.
@@ -162,28 +160,36 @@ def _detect_client_or_project_in_question(question: str) -> Dict[str, str]:
     print(f"DEBUG (Detector): Questão recebida: '{question}'")
 
     # 1. Detecção de Nome de Cliente (usando a lista dinâmica de _known_client_names)
-    # Esta é a forma mais robusta e dinâmica.
     if _known_client_names: # Certifica-se de que a lista foi carregada
         for client_name in _known_client_names:
-            # Usar word boundaries (\b) para evitar falsos positivos (ex: "SCENS" em "ASCENSO").
-            # re.escape() para tratar caracteres especiais em nomes de clientes, se houver.
-            if re.search(r'\b' + re.escape(client_name.lower()) + r'\b', question_lower):
+            client_name_lower = client_name.lower()
+            
+            # Tenta detecção com word boundaries (precisa)
+            search_pattern_regex = r'\\b' + re.escape(client_name_lower) + r'\\b'
+            print(f"DEBUG (Detector): Tentando padrão regex '{search_pattern_regex}' para cliente '{client_name}'")
+            if re.search(search_pattern_regex, question_lower):
                 detected_filters["client_name"] = client_name # Já está em UPPERCASE
-                print(f"DEBUG (Detector): Cliente detectado por lista de nomes conhecidos: '{detected_filters['client_name']}'")
+                print(f"DEBUG (Detector): Cliente detectado por regex e lista de nomes conhecidos: '{detected_filters['client_name']}'")
                 break # Encontrou um cliente, não precisa procurar mais
             else:
-                print(f"DEBUG (Detector): Cliente '{client_name}' não encontrado na questão (busca direta).")
+                # Fallback: Se a regex com word boundary falhou, tenta uma busca simples 'in'
+                if client_name_lower in question_lower:
+                    detected_filters["client_name"] = client_name # Já está em UPPERCASE
+                    print(f"DEBUG (Detector): Cliente detectado por busca direta 'in' (fallback robusto): '{detected_filters['client_name']}'")
+                    break # Encontrou um cliente, não precisa procurar mais
+                else:
+                    print(f"DEBUG (Detector): Cliente '{client_name}' não encontrado na questão (busca direta ou regex).")
     else:
         print("DEBUG (Detector): _known_client_names não carregada ou vazia. Não foi possível usar a detecção dinâmica de clientes.")
 
     # 2. Detecção de Código de Projeto (D + dígitos)
-    project_code_match_d = re.search(r"D\d{9,15}", question, re.IGNORECASE)
+    project_code_match_d = re.search(r"D\\d{9,15}", question, re.IGNORECASE)
     if project_code_match_d:
         detected_filters["project_code"] = project_code_match_d.group(0).upper()
         print(f"DEBUG (Detector): Código de Projeto detectado: '{detected_filters['project_code']}'")
 
     # 3. Detecção de Tipo de Documento (MIT + 3 dígitos)
-    doc_type_match = re.search(r"(MIT\d{3})", question, re.IGNORECASE)
+    doc_type_match = re.search(r"(MIT\\d{3})", question, re.IGNORECASE)
     if doc_type_match:
         detected_filters["doc_type"] = doc_type_match.group(1).upper()
         print(f"DEBUG (Detector): Tipo de Documento detectado: '{detected_filters['doc_type']}'")
@@ -198,7 +204,7 @@ def retrieve_context_node(state: AgentState):
     """
     Nó para recuperar chunks relevantes da base de conhecimento.
     Recebe a pergunta do usuário e quaisquer filtros ativos do estado do agente.
-    Adicionado log detalhado dos chunks recuperados para depuração.
+    Adicionado log detalhado dos chunks recuperados para depuração e filtragem manual.
     """
     global _vector_store
 
@@ -214,28 +220,30 @@ def retrieve_context_node(state: AgentState):
     
     # Detecta filtros da pergunta atual
     detected_filters_from_question = _detect_client_or_project_in_question(question)
-    print(f"DEBUG: Filtros detectados da pergunta: {detected_filters_from_question}") # Log adicional aqui
+    print(f"DEBUG: Filtros detectados da pergunta: {detected_filters_from_question}")
     
     # Prepara os filtros para o ChromaDB usando a sintaxe de $and para múltiplos
     chroma_filter_conditions = []
     
+    # Captura o client_name detectado para uso na filtragem manual
+    expected_client_name = None
     if "client_name" in detected_filters_from_question:
-        client_name = detected_filters_from_question["client_name"]
-        chroma_filter_conditions.append({"client_name": client_name}) 
-        print(f"  -> Filtro de cliente DETECTADO para ChromaDB: '{client_name}'") # Log adicional aqui
+        expected_client_name = detected_filters_from_question["client_name"]
+        chroma_filter_conditions.append({"client_name": expected_client_name}) 
+        print(f"  -> Filtro de cliente DETECTADO para ChromaDB (tentativa automática): '{expected_client_name}'")
     
     if "project_code" in detected_filters_from_question:
         project_code = detected_filters_from_question["project_code"]
         chroma_filter_conditions.append({"project_code": project_code})
-        print(f"  -> Filtro de código de projeto DETECTADO para ChromaDB: '{project_code}'") # Log adicional aqui
+        print(f"  -> Filtro de código de projeto DETECTADO para ChromaDB (tentativa automática): '{project_code}'")
 
     if "doc_type" in detected_filters_from_question:
         doc_type = detected_filters_from_question["doc_type"]
         chroma_filter_conditions.append({"doc_type": doc_type})
-        print(f"  -> Filtro de tipo de documento DETECTADO para ChromaDB: '{doc_type}'") # Log adicional aqui
+        print(f"  -> Filtro de tipo de documento DETECTADO para ChromaDB (tentativa automática): '{doc_type}'")
 
     # =====================================================================
-    # >>>>> USANDO as_retriever COM search_kwargs PARA FILTRAGEM <<<<<
+    # >>>>> USANDO as_retriever. Passando o filtro, mesmo sabendo que pode não ser totalmente eficaz <<<<<
 
     top_N_chunks = 10 
     
@@ -243,56 +251,67 @@ def retrieve_context_node(state: AgentState):
     if chroma_filter_conditions:
         if len(chroma_filter_conditions) == 1:
             final_chroma_filter_clause = chroma_filter_conditions[0]
-            print(f"  -> Aplicando filtro único no ChromaDB via retriever: {final_chroma_filter_clause}")
+            print(f"  -> Aplicando filtro único no ChromaDB via retriever (tentativa automática): {final_chroma_filter_clause}")
         else:
             final_chroma_filter_clause = {"$and": chroma_filter_conditions}
-            print(f"  -> Aplicando múltiplos filtros (AND) no ChromaDB via retriever: {final_chroma_filter_clause}")
+            print(f"  -> Aplicando múltiplos filtros (AND) no ChromaDB via retriever (tentativa automática): {final_chroma_filter_clause}")
         search_kwargs["filter"] = final_chroma_filter_clause
     else:
         print("  -> Nenhum filtro específico detectado. Realizando busca geral via retriever.")
 
     # Obtém o retriever e faz a busca
     retriever = _vector_store.as_retriever(search_kwargs=search_kwargs)
-    retrieved_docs = retriever.invoke(question)
-    
+    retrieved_docs_raw = retriever.invoke(question) # Renomeado para indicar que são os chunks brutos
+
     # =====================================================================
     
-    # --- LOG DETALHADO PARA DIAGNÓSTICO DO FILTRO ---
-    print(f"DEBUG: {len(retrieved_docs)} chunks RECUPERADOS APÓS APLICAÇÃO DE FILTRO. Verificando metadados:\n")
-    if not retrieved_docs:
-        print("DEBUG: Nenhuma informação relevante foi recuperada após filtragem.\n")
+    # --- LOG DOS CHUNKS RECUPERADOS BRUTOS (antes da filtragem manual) ---
+    print(f"DEBUG: {len(retrieved_docs_raw)} chunks RECUPERADOS BRUTOS (antes da filtragem manual). Verificando metadados:\\n")
     
-    source_docs_metadata = [] # Variável inicializada aqui!
-    for i, doc in enumerate(retrieved_docs):
+    # --- FILTRAGEM MANUAL DE EMERGÊNCIA ---
+    retrieved_docs_filtered = []
+    
+    # Itera sobre os chunks brutos e aplica a filtragem manual
+    for i, doc in enumerate(retrieved_docs_raw):
         retrieved_client_name = doc.metadata.get('client_name', 'N/A')
         retrieved_original_filename = doc.metadata.get('original_filename', 'N/A')
-        retrieved_doc_type = doc.metadata.get('doc_type', 'N/A') # Adicionar tipo de documento
+        retrieved_doc_type = doc.metadata.get('doc_type', 'N/A')
 
-        print(f"--- Chunk {i+1} ---")
+        print(f"--- Chunk {i+1} (Bruto) ---")
         print(f"  Client Name: {retrieved_client_name}")
         print(f"  Doc Type: {retrieved_doc_type}")
         print(f"  Original Filename: {retrieved_original_filename}")
         print(f"  Page Content (primeiros 150 chars): {doc.page_content[:150]}...")
         
-        # Alerta se um chunk não corresponder ao cliente esperado
-        expected_client = detected_filters_from_question.get('client_name')
-        if expected_client and retrieved_client_name != expected_client:
-            print(f"  !!! ALERTA: chunk {i+1} é do cliente '{retrieved_client_name}' e NÃO CORRESPONDE ao cliente esperado '{expected_client}' !!!")
+        # Lógica de filtragem: Se um client_name foi detectado na pergunta E o chunk não corresponde, REJEITAR.
+        if expected_client_name and retrieved_client_name != expected_client_name:
+            print(f"  -> Chunk REJEITADO pela filtragem manual (não corresponde ao cliente esperado '{expected_client_name}').")
+        else:
+            retrieved_docs_filtered.append(doc)
+            print(f"  -> Chunk ACEITO pela filtragem manual (corresponde ou não há cliente esperado).")
+        print(f"--- Fim Chunk {i+1} (Bruto) ---\\n")
+    
+    # Atribui os chunks filtrados para o processamento subsequente
+    retrieved_docs = retrieved_docs_filtered
+    
+    if not retrieved_docs:
+        print(f"WARNING: Após a filtragem manual, nenhum chunk restou para o cliente '{expected_client_name}' (se aplicável). "
+              f"O LLM pode indicar que não encontrou informações suficientes.\\n")
         
-        print(f"--- Fim Chunk {i+1} ---\n") # Adicionado \n para melhor legibilidade no console
-
-        # Preenchendo source_docs_metadata para uso posterior na citação
+    # Preenchendo source_docs_metadata para uso posterior na citação
+    source_docs_metadata = []
+    for doc in retrieved_docs:
         source_docs_metadata.append({
             "source": doc.metadata.get('source', 'N/A'),
-            "document_id": retrieved_original_filename,
-            "client_name": retrieved_client_name,
-            "doc_type": retrieved_doc_type,
+            "document_id": doc.metadata.get('original_filename', 'N/A'),
+            "client_name": doc.metadata.get('client_name', 'N/A'),
+            "doc_type": doc.metadata.get('doc_type', 'N/A'),
             "project_code_crm": doc.metadata.get('project_code', 'N/A'),
             "page_content": doc.page_content 
         })
     # --- FIM LOG DETALHADO ---
 
-    print(f"DEBUG: {len(retrieved_docs)} chunks recuperados para o LLM.\n") # Adicionado \n para melhor legibilidade no console
+    print(f"DEBUG: {len(retrieved_docs)} chunks FINAIS ENVIADOS para o LLM após filtragem manual.\\n")
     return {"context": retrieved_docs, "source_docs": source_docs_metadata, "filters": detected_filters_from_question}
 
 
@@ -305,7 +324,10 @@ def generate_response_node(state: AgentState):
     question = state["question"]
     context_docs = state["context"]
 
-    context_text = "\n\n".join([doc.page_content for doc in context_docs])
+    if not context_docs:
+        return {"answer": "Não encontrei informações suficientes no contexto fornecido para responder a esta pergunta."}
+
+    context_text = "\\n\\n".join([doc.page_content for doc in context_docs])
 
     prompt_template = ChatPromptTemplate.from_messages(
         [
@@ -320,9 +342,9 @@ def generate_response_node(state: AgentState):
              "Se a informação necessária para formar uma resposta completa e adequada **não estiver presente ou for insuficiente** no contexto fornecido, "
              "declare 'Não encontrei informações suficientes no contexto fornecido para responder a esta pergunta.' "
              "**Não invente informações.** "
-             "Contexto: {context}"
+             f"Contexto: {context_text}"
             ),
-            ("human", "{question}"),
+            ("human", f"{question}"),
         ]
     )
 
@@ -330,7 +352,8 @@ def generate_response_node(state: AgentState):
     response = chain.invoke({"question": question, "context": context_text})
     print("DEBUG: Resposta gerada pelo LLM.")
 
-    cleaned_response = response.strip()
+    # Garante que qualquer \\n vindo do LLM seja um \n real no Python, e não \\n literal.
+    cleaned_response = response.strip().replace('\\\n', '\n')
     print(f"DEBUG: Resposta antes da verificação de repetição: '{cleaned_response}'")
 
     response_to_return = cleaned_response
@@ -341,7 +364,7 @@ def generate_response_node(state: AgentState):
         response_to_return = cleaned_response[:half_len].strip()
         print("DEBUG: Repetição exata da resposta completa detectada e removida.")
     else:
-        match = re.match(r"^(.*?)(?:\s*\1\s*)+$", cleaned_response, re.DOTALL)
+        match = re.match(r"^(.*?)(?:\\s*\\1\\s*)+$", cleaned_response, re.DOTALL)
         if match:
             response_to_return = match.group(1).strip()
             print(f"DEBUG: Repetição de padrão detectada e removida pela regex. Original: '{cleaned_response}', Processada: '{response_to_return}'")
@@ -353,30 +376,31 @@ def generate_response_node(state: AgentState):
 
 def format_citation_node(state: AgentState):
     """
-    Nó para formatar a resposta final, incorporando uma citação concisa e exata da fonte.
-    Tenta encontrar o chunk que contém a informação da resposta ou o mais relevante como fallback.
+    Nó para formatar a resposta final, incorporando uma citação concisa e bem formatada da fonte.
+    Prioriza o chunk mais relevante, mas oferece fallback.
     """
     print("DEBUG: Executando format_citation_node para referências exatas.")
     answer = state["answer"]
     all_source_docs = state["source_docs"]
 
-    selected_doc_meta_for_citation = None
-    snippet_to_cite = None
+    # Se o LLM respondeu que não encontrou informações, não há citação
+    if "Não encontrei informações suficientes" in answer:
+        print("DEBUG: Resposta indica falta de informação, sem citação.")
+        return {"answer": answer}
 
-    extracted_numbers = re.findall(r'\d+', answer)
+    selected_doc_meta_for_citation = None
     
+    extracted_numbers = re.findall(r'\\d+', answer)
     relevant_keywords = []
-    # Adicionado mais palavras-chave para melhor detecção da citação
-    if "licenças" in answer.lower():
-        relevant_keywords.append("licenças")
-    if "ids" in answer.lower():
-        relevant_keywords.append("ids")
-    if "contratadas" in answer.lower():
-        relevant_keywords.append("contratadas")
-    if "personalizações" in answer.lower():
-        relevant_keywords.append("personalizações")
-    if "campos" in answer.lower():
-        relevant_keywords.append("campos")
+
+    common_keywords = [
+        "licenças", "ids", "contratadas", "personalizações", "customizações",
+        "campos", "integração", "filtros", "cliente", "clientes",
+        "ordens de venda", "erp protheus", "ipass", "endereços", "cadastro"
+    ]
+    for kw in common_keywords:
+        if kw in answer.lower():
+            relevant_keywords.append(kw)
     
     for doc_meta in all_source_docs:
         current_snippet = doc_meta.get('page_content', '').strip()
@@ -385,54 +409,52 @@ def format_citation_node(state: AgentState):
         is_strong_match = False
         
         # Lógica de correspondência de citação aprimorada
-        if relevant_keywords and extracted_numbers:
-             if any(kw in current_snippet_lower for kw in relevant_keywords) and \
-                any(num in current_snippet for num in extracted_numbers):
-                 is_strong_match = True
-        elif relevant_keywords and not extracted_numbers:
-            if any(kw in current_snippet_lower for kw in relevant_keywords):
-                is_strong_match = True
-        elif extracted_numbers and not relevant_keywords:
-            if any(num in current_snippet for num in extracted_numbers):
-                is_strong_match = True
-        
-        # Também verifica se a resposta gerada está contida no snippet (match mais direto)
-        # Atenção: LLMs podem parafrasear, então o match exato pode falhar.
-        # Mas para snippets curtos de fatos, é útil.
-        if answer.lower() in current_snippet_lower:
+        # 1. Busca por tokens-chave da resposta no snippet (ignorando stopwords e tokens curtos)
+        answer_tokens = [token for token in re.findall(r'\\b\\w+\\b', answer.lower()) if token not in {'de', 'da', 'do', 'e', 'o', 'a', 'os', 'as', 'em', 'um', 'uma'} and len(token) > 2]
+        snippet_tokens = [token for token in re.findall(r'\\b\\w+\\b', current_snippet_lower) if token not in {'de', 'da', 'do', 'e', 'o', 'a', 'os', 'as', 'em', 'um', 'uma'} and len(token) > 2]
+
+        if all(token in snippet_tokens for token in answer_tokens):
             is_strong_match = True
 
+        if not is_strong_match: # Fallback se o match de tokens não foi suficiente
+             if (relevant_keywords and any(kw in current_snippet_lower for kw in relevant_keywords)) and \
+                (extracted_numbers and any(num in current_snippet for num in extracted_numbers)):
+                 is_strong_match = True
+             elif relevant_keywords and not extracted_numbers: 
+                 if any(kw in current_snippet_lower for kw in relevant_keywords):
+                     is_strong_match = True
+             elif extracted_numbers and not relevant_keywords: 
+                 if any(num in current_snippet for num in extracted_numbers):
+                     is_strong_match = True
+        
         if is_strong_match:
             selected_doc_meta_for_citation = doc_meta
-            snippet_to_cite = current_snippet
             print(f"DEBUG: Encontrado chunk 'exato' para citar (match forte): {doc_meta['document_id']}")
             break
 
     if selected_doc_meta_for_citation is None and all_source_docs:
         # Fallback para o primeiro chunk se nenhum match forte for encontrado
         selected_doc_meta_for_citation = all_source_docs[0]
-        snippet_to_cite = selected_doc_meta_for_citation.get('page_content', '').strip()
         print("DEBUG: Nenhuma citação 'exata' encontrada, usando o chunk mais similar como fallback.")
     elif selected_doc_meta_for_citation is None:
         print("DEBUG: Nenhuma citação encontrada (lista de chunks vazia).")
 
     final_citation_entry = None
     if selected_doc_meta_for_citation:
-        citation_parts = [
-            f"**Documento:** {selected_doc_meta_for_citation['document_id']} "
-            f"(Cliente: {selected_doc_meta_for_citation.get('client_name', 'N/A')}, "
-            f"Tipo: {selected_doc_meta_for_citation.get('doc_type', 'N/A')}, "
-            f"Código Projeto CRM: {selected_doc_meta_for_citation.get('project_code_crm', 'N/A')})"
-        ]
-        if snippet_to_cite:
-            # Garante que o snippet exibido não seja excessivamente longo
-            if len(snippet_to_cite) > 500: # Aumentado o limite para capturar mais contexto
-                snippet_to_cite = snippet_to_cite[:500] + "..."
-            citation_parts.append(f"'{snippet_to_cite}'")
-        final_citation_entry = "\n".join(citation_parts)
+        # Usando \n para cada quebra de linha desejada na citação.
+        # Isto é o que o Streamlit espera para Markdown.
+        citation_info = (
+            f"**Documento:** {selected_doc_meta_for_citation['document_id']}\n" 
+            f"**Cliente:** {selected_doc_meta_for_citation.get('client_name', 'N/A')}\n" 
+            f"**Tipo:** {selected_doc_meta_for_citation.get('doc_type', 'N/A')}"
+        )
+        final_citation_entry = citation_info
 
     final_answer_text = answer
     if final_citation_entry:
-        final_answer_text += "\n\n**Fontes Consultadas:**\n\n" + final_citation_entry
+        # Garante que a resposta principal também esteja livre de \\n literal.
+        final_answer_text = final_answer_text.replace('\\n', '\n') 
+        # Usa \n\n para criar um espaçamento de parágrafo antes das Fontes Consultadas.
+        final_answer_text += "\n\n---\n**Fontes Consultadas:**\n" + final_citation_entry
 
     return {"answer": final_answer_text}
