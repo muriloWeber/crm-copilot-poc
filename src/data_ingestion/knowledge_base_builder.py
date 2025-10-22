@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import httpx
 from chromadb.utils import embedding_functions
 from langchain_core.documents import Document
+import hashlib # Importar hashlib para gerar o hash do documento
 
 # Carrega as variáveis de ambiente do .env
 load_dotenv()
@@ -24,8 +25,8 @@ RAW_DOCUMENTS_DIR = DATA_DIR / "raw_documents"
 VECTOR_DB_DIR = DATA_DIR / "vector_db" / "chroma_db"
 CHROMA_COLLECTION_NAME = 'tcrm_copilot_kb' 
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
-CHUNK_SIZE = 250
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 250 # Mantendo seu CHUNK_SIZE
+CHUNK_OVERLAP = 50 # Mantendo seu CHUNK_OVERLAP
 
 # Garante que os diretórios existam
 RAW_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,13 +43,8 @@ embeddings_model = OpenAIEmbeddings(
     http_client=custom_http_client
 )
 
-# Inicializa o ChromaDB
-# Excluímos o parametro client_settings pois ele interfere no funcionamento em alguns SO's
-# db = Chroma(persist_directory=str(VECTOR_DB_DIR), embedding_function=embeddings_model)
-
-
 def load_and_chunk_documents():
-    documents = []
+    documents_with_metadata = [] # Renomeado para evitar confusão com 'documents' na função
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -81,23 +77,24 @@ def load_and_chunk_documents():
         try:
             # Carrega o conteúdo do documento
             doc_content = "".join([page.page_content for page in loader.load()])
+            
+            # === NOVO: Gerar um hash único para o conteúdo original do documento ===
+            document_hash = hashlib.sha256(doc_content.encode('utf-8')).hexdigest()
+            # ======================================================================
 
             # MODIFICAÇÃO: Extrai client_name e doc_type do filename ou content
             client_name_match = re.search(r'\[([A-Za-z0-9_\s]+)\]', filename)
             # Prioriza o nome dentro de colchetes, se não encontrar, tenta por heurística simples ou Unknown
             client_name = client_name_match.group(1).strip() if client_name_match else 'Unknown Client'
             
-            # === REMOÇÃO DO HARDCODING 'Scens' NO knowledge_base_builder.py ===
             # AGORA, TODOS OS NOMES DE CLIENTE VÁLIDOS SÃO PADRONIZADOS PARA UPPERCASE NO METADADO.
             if client_name != 'Unknown Client':
                 client_name = client_name.upper() 
-            # ======================================================================
-
+            
             doc_type_match = re.search(r'(MIT\d{3})', filename, re.IGNORECASE)
             doc_type = doc_type_match.group(1).upper() if doc_type_match else 'Generic Doc'
 
-            # MODIFICAÇÃO: Extrai project_code. Para PoC, o da KION é o mais evidente no nome.
-            # O da Marson está no content, mas não no nome, dificultando extrair só do nome.
+            # MODIFICAÇÃO: Extrai project_code.
             project_code_match = re.search(r'Código do Projeto: (D\d{9,15})', doc_content)
             project_code = project_code_match.group(1).strip() if project_code_match else 'Unknown Project'
 
@@ -108,17 +105,19 @@ def load_and_chunk_documents():
                 metadata = {
                     "source": os.path.join("data", "raw_documents", filename), # Caminho relativo
                     "original_filename": filename,
-                    "client_name": client_name, # MODIFICAÇÃO: Metadado client_name
-                    "doc_type": doc_type,       # MODIFICAÇÃO: Metadado doc_type
-                    "project_code": project_code, # MODIFICAÇÃO: Metadado project_code
-                    "chunk_number": i + 1
+                    "client_name": client_name, 
+                    "doc_type": doc_type,       
+                    "project_code": project_code,
+                    "chunk_number": i + 1,      # Mantém seu chunk_number (1-based)
+                    "chunk_index": i,           # NOVO: chunk_index (0-based) para lógica do agente
+                    "document_hash": document_hash # NOVO: Hash para identificar o documento original
                 }
-                documents.append(Document(page_content=chunk_content, metadata=metadata))
+                documents_with_metadata.append(Document(page_content=chunk_content, metadata=metadata))
 
         except Exception as e:
             print(f"Erro ao processar {filename}: {e}")
 
-    return documents
+    return documents_with_metadata
 
 
 if __name__ == "__main__":
@@ -144,4 +143,3 @@ if __name__ == "__main__":
         print("Ingestão concluída e ChromaDB persistido.")
     else:
         print("Nenhum documento para ingestão. Verifique a pasta 'data/raw_documents'.")
-
