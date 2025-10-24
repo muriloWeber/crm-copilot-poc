@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 import logging
 
 # Configura o logger
-logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 
 # Carrega as variáveis de ambiente do .env
 load_dotenv()
@@ -252,10 +252,11 @@ def retrieve_context_node(state: AgentState):
     retrieved_docs_filtered_and_expanded = []
     seen_chunks_identifiers = set() # Para evitar duplicatas após a expansão (document_hash, chunk_index)
 
-    # Passo 1: Filtragem inicial baseada no client_name (já existente)
+    # Passo 1: Filtragem inicial baseada no client_name (já existente e funcionando)
     initial_relevant_chunks = []
     for i, doc in enumerate(retrieved_docs_raw):
         retrieved_client_name = doc.metadata.get('client_name', 'N/A')
+        # AQUI: A filtragem já acontece com o cliente detectado. Se expected_client_name for None, ele não filtra.
         if expected_client_name and retrieved_client_name != expected_client_name:
             logging.debug(f"  -> Chunk {i+1} REJEITADO pela filtragem manual (não corresponde ao cliente esperado '{expected_client_name}').")
         else:
@@ -263,14 +264,15 @@ def retrieve_context_node(state: AgentState):
             logging.debug(f"  -> Chunk {i+1} ACEITO pela filtragem manual (corresponde ou não há cliente esperado).")
 
     # Passo 2: Expansão de contexto para os chunks mais relevantes
-    # Palavras-chave que indicam que um chunk pode ser o "cabeçalho" de uma seção importante
     header_keywords = [
         "demandas não aderentes", "premissas do escopo técnico", "considerações finais",
         "escopo administrativo", "escopo de leads", "escopo de clientes",
         "escopo de atividades", "escopo de produtos e serviços", "escopo de oportunidades",
         "escopo de ordem de venda", "escopo de documentos", "escopo de analytics",
         "módulos adicionais", "personalização de integração", "personalizações de crm",
-        "definição do escopo", "detalhamento do escopo" # Adicionado para Marson
+        "definição do escopo", "detalhamento do escopo", "roteiro do projeto", "visão geral do projeto",
+        "tecnologias-chave confirmadas", "fase 1: preparação do ambiente", "fase 2: construção da base",
+        "fase 3: orquestração langgraph", "fase 4: teste, refinamento e avaliação", "definição dos nós"
     ]
 
     for seed_doc in initial_relevant_chunks:
@@ -290,15 +292,17 @@ def retrieve_context_node(state: AgentState):
         if is_header_chunk:
             logging.debug(f"DEBUG: Chunk {original_filename}[{chunk_index}] identificado como potencial cabeçalho de seção. Iniciando expansão.")
             
-            # Re-consultar o ChromaDB para todos os chunks deste documento que pertencem ao cliente esperado
-            # e com o mesmo document_hash
+            # --- FIX CRÍTICO AQUI ---
+            where_clause_for_expansion = {"document_hash": doc_hash}
+            # Adiciona o filtro de client_name APENAS se um client_name foi detectado E NÃO É UM PLACEHOLDER GENÉRICO
+            if expected_client_name is not None and expected_client_name != "UNKNOWN CLIENT":
+                where_clause_for_expansion["client_name"] = expected_client_name
+
             all_chunks_from_doc_results = _vector_store._collection.get(
-                where={"$and": [
-                    {"document_hash": doc_hash},
-                    {"client_name": expected_client_name} # Mantém o filtro de cliente
-                ]},
+                where=where_clause_for_expansion, # AGORA ESTÁ SEGURO
                 include=['documents', 'metadatas']
             )
+            # --- FIM DO FIX CRÍTICO ---
             
             doc_chunks_by_index = sorted([
                 Document(page_content=all_chunks_from_doc_results['documents'][j], 
@@ -310,12 +314,13 @@ def retrieve_context_node(state: AgentState):
             end_index_for_expansion = min(len(doc_chunks_by_index), chunk_index + CONTEXT_EXPANSION_WINDOW + 1)
             
             for k in range(start_index_for_expansion, end_index_for_expansion):
-                chunk_to_add = doc_chunks_by_index[k]
-                chunk_identifier = (chunk_to_add.metadata.get('document_hash'), chunk_to_add.metadata.get('chunk_index'))
-                if chunk_identifier not in seen_chunks_identifiers:
-                    retrieved_docs_filtered_and_expanded.append(chunk_to_add)
-                    seen_chunks_identifiers.add(chunk_identifier)
-                    logging.debug(f"    -> Adicionado chunk vizinho {chunk_to_add.metadata.get('original_filename')}[{chunk_to_add.metadata.get('chunk_index')}] via expansão.")
+                if k < len(doc_chunks_by_index): # Proteção extra para garantir que o índice é válido
+                    chunk_to_add = doc_chunks_by_index[k]
+                    chunk_identifier = (chunk_to_add.metadata.get('document_hash'), chunk_to_add.metadata.get('chunk_index'))
+                    if chunk_identifier not in seen_chunks_identifiers:
+                        retrieved_docs_filtered_and_expanded.append(chunk_to_add)
+                        seen_chunks_identifiers.add(chunk_identifier)
+                        logging.debug(f"    -> Adicionado chunk vizinho {chunk_to_add.metadata.get('original_filename')}[{chunk_to_add.metadata.get('chunk_index')}] via expansão.")
         else:
             # Se não é um chunk de cabeçalho, apenas o adiciona se não foi adicionado pela expansão
             chunk_identifier = (doc_hash, chunk_index)

@@ -25,8 +25,8 @@ RAW_DOCUMENTS_DIR = DATA_DIR / "raw_documents"
 VECTOR_DB_DIR = DATA_DIR / "vector_db" / "chroma_db"
 CHROMA_COLLECTION_NAME = 'tcrm_copilot_kb' 
 EMBEDDING_MODEL_NAME = "text-embedding-ada-002"
-CHUNK_SIZE = 250 # Mantendo seu CHUNK_SIZE
-CHUNK_OVERLAP = 50 # Mantendo seu CHUNK_OVERLAP
+CHUNK_SIZE = 750 # Mantendo seu CHUNK_SIZE
+CHUNK_OVERLAP = 150 # Mantendo seu CHUNK_OVERLAP
 
 # Garante que os diretórios existam
 RAW_DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)

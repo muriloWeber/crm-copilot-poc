@@ -4,9 +4,12 @@ import sys
 import os
 import streamlit as st
 import time
+import logging
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage # <--- NOVA IMPORTAÇÃO AQUI
 from langgraph.graph import StateGraph, END
+
+logging.basicConfig(level=logging.INFO) 
 
 # Adiciona a raiz do projeto ao sys.path para que o Python encontre o pacote 'src'
 # independentemente de como o Streamlit é executado.
