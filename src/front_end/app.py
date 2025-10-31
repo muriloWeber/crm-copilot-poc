@@ -12,10 +12,11 @@ import time
 import logging
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.graph import StateGraph, END
+# Removido 'StateGraph, END' daqui pois build_graph já importa
+# from langgraph.graph import StateGraph, END
 
 # Configura o logger
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # Mantenha INFO para evitar muita verbosidade da rede
 logger = logging.getLogger(__name__)
 
 # Adiciona a raiz do projeto ao sys.path para que o Python encontre o pacote 'src'
@@ -37,31 +38,19 @@ else:
 # --- FIM VERIFICAÇÃO DE AMBIENTE ---
 
 # --- Importar as definições do agente que criamos ---
-# Estes imports agora funcionarão porque a raiz do projeto está no sys.path
-from src.core.copilot_agent import AgentState, retrieve_context_node, generate_response_node, format_citation_node
+# Agora importamos a função build_graph diretamente, que já tem o grafo completo
+from src.core.copilot_agent import AgentState, build_graph # <--- IMPORTAÇÃO CORRIGIDA!
 from src.data_ingestion.incremental_ingestor import add_document_to_vector_store, get_chroma_instance, get_embeddings_model
 from langchain.text_splitter import RecursiveCharacterTextSplitter # Importar text_splitter para inicialização
 
 
 # --- Configuração do Agente LangGraph ---
-def create_agent_workflow():
-    workflow = StateGraph(AgentState)
-
-    workflow.add_node("retrieve_context", retrieve_context_node)
-    workflow.add_node("generate_response", generate_response_node)
-    workflow.add_node("format_citation", format_citation_node)
-
-    workflow.set_entry_point("retrieve_context")
-    workflow.add_edge("retrieve_context", "generate_response")
-    workflow.add_edge("generate_response", "format_citation")
-    workflow.add_edge("format_citation", END)
-
-    return workflow.compile()
+# REMOVIDA A FUNÇÃO create_agent_workflow() DAQUI, POIS USAMOS build_graph() DO copilot_agent.py
 
 # Inicializa o agente e componentes na primeira execução do Streamlit
 if "copilot_agent" not in st.session_state:
     try:
-        st.session_state.copilot_agent = create_agent_workflow()
+        st.session_state.copilot_agent = build_graph() # <--- AGORA CHAMAMOS build_graph() CORRETAMENTE!
         st.session_state.llm_initialized = True
         logger.info("Copilot Agent inicializado com sucesso.")
     except Exception as e:
@@ -198,25 +187,8 @@ if prompt := st.chat_input("Pergunte ao Copilot sobre seu projeto..."):
                 elif msg["role"] == "assistant":
                     lc_messages.append(AIMessage(content=msg["content"]))
 
-            # --- EXTRAÇÃO DE METADADOS DA PERGUNTA DO USUÁRIO (NOVIDADE AQUI!) ---
-            extracted_filters = {}
-            # Regex para CLIENTE: [CLIENTE]
-            client_match = re.search(r'\[(.*?)\]', prompt)
-            if client_match:
-                extracted_filters["client_name"] = client_match.group(1).upper()
-                logger.info(f"Filtro de cliente extraído da pergunta: {extracted_filters['client_name']}")
-            
-            # Regex para CÓDIGO DO PROJETO: DXXXXXXXXXX
-            project_code_match = re.search(r'(D\\d{9,15})', prompt, re.IGNORECASE)
-            if project_code_match:
-                extracted_filters["project_code"] = project_code_match.group(1).upper()
-                logger.info(f"Filtro de código de projeto extraído da pergunta: {extracted_filters['project_code']}")
-
-            # Regex para TIPO DE DOCUMENTO: MITXXX (menos comum de pedir na pergunta, mas bom ter)
-            doc_type_match = re.search(r'(MIT\\d{3})', prompt, re.IGNORECASE)
-            if doc_type_match:
-                extracted_filters["doc_type"] = doc_type_match.group(1).upper()
-                logger.info(f"Filtro de tipo de documento extraído da pergunta: {extracted_filters['doc_type']}")
+            # --- REMOVIDA A EXTRAÇÃO DE METADADOS DA PERGUNTA DO USUÁRIO AQUI ---
+            # Essa extração agora é feita pelo 'extract_filters_node' no grafo.
             
             initial_agent_state = AgentState(
                 question=prompt,
@@ -224,7 +196,7 @@ if prompt := st.chat_input("Pergunte ao Copilot sobre seu projeto..."):
                 source_docs=[],     # Será populado por retrieve_context_node
                 answer="",          # Será populado por generate_response_node
                 messages=lc_messages, # Mensagens convertidas para o formato LangChain
-                filters=extracted_filters # <--- AGORA PASSAMOS OS FILTROS AQUI!
+                filters={} # <--- FILTROS INICIALIZADOS VAZIOS. extract_filters_node irá populá-los.
             )
 
             # Invocar o agente LangGraph

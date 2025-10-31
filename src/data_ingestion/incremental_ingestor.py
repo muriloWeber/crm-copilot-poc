@@ -1,5 +1,3 @@
-# src/data_ingestion/incremental_ingestor.py
-
 import os
 import hashlib
 import logging
@@ -8,15 +6,16 @@ import datetime
 import re
 from typing import List, Dict, Union, Any, Optional
 
-import openai # Importar a biblioteca openai para pegar a exceção específica
+import openai
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
-import httpx # Para o cliente HTTP customizado com verify=False
+import httpx
 
 # Configura o logger para a ingestão
+# OBS: O nível de log pode ser ajustado para DEBUG se necessário para depuração detalhada
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -51,52 +50,55 @@ def get_document_loader(file_path: str) -> Optional[Union[PyPDFLoader, Docx2txtL
         logger.warning(f"Extensão de arquivo não suportada: {file_extension}")
         return None
 
+_embeddings_model: Optional[OpenAIEmbeddings] = None
 def get_embeddings_model() -> OpenAIEmbeddings:
     """Inicializa e retorna o modelo de embeddings da OpenAI."""
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    openai_api_base = os.getenv("OPENAI_API_BASE")
+    global _embeddings_model # Garante que a instância seja única e persistente
+    if _embeddings_model is None:
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        openai_api_base = os.getenv("OPENAI_API_BASE")
 
-    if not openai_api_key:
-        raise ValueError("Variável de ambiente OPENAI_API_KEY não configurada para embeddings.")
-    
-    # Configura o cliente HTTP para ignorar a verificação SSL
-    custom_http_client = httpx.Client(verify=False)
+        if not openai_api_key:
+            raise ValueError("Variável de ambiente OPENAI_API_KEY não configurada para embeddings.")
+        
+        # Configura o cliente HTTP para ignorar a verificação SSL
+        custom_http_client = httpx.Client(verify=False)
 
-    return OpenAIEmbeddings(
-        model=EMBEDDING_MODEL_NAME,
-        openai_api_key=openai_api_key,
-        base_url=openai_api_base if openai_api_base else None,
-        http_client=custom_http_client
-    )
+        _embeddings_model = OpenAIEmbeddings(
+            model=EMBEDDING_MODEL_NAME,
+            openai_api_key=openai_api_key,
+            base_url=openai_api_base if openai_api_base else None,
+            http_client=custom_http_client
+        )
+    return _embeddings_model
 
-_embeddings_model: Optional[OpenAIEmbeddings] = None
+_chroma_instance: Optional[Chroma] = None
 def get_chroma_instance() -> Chroma:
     """
     Retorna uma instância do ChromaDB.
     Se o diretório não existir, ele será criado.
     """
-    global _embeddings_model
-    if _embeddings_model is None:
-        _embeddings_model = get_embeddings_model()
-
-    if not os.path.exists(CHROMA_DB_DIRECTORY):
-        logger.info(f"Diretório ChromaDB não encontrado em {CHROMA_DB_DIRECTORY}. Criando...")
-        os.makedirs(CHROMA_DB_DIRECTORY, exist_ok=True)
-        # O ChromaDB será inicializado como vazio e populado na primeira ingestão
-        vector_store = Chroma(
-            persist_directory=CHROMA_DB_DIRECTORY,
-            embedding_function=_embeddings_model,
-            collection_name=CHROMA_COLLECTION_NAME
-        )
-        logger.info(f"Nova instância ChromaDB criada em {CHROMA_DB_DIRECTORY} com coleção '{CHROMA_COLLECTION_NAME}'.")
-        return vector_store
-    else:
-        logger.info(f"ChromaDB carregado do diretório: {CHROMA_DB_DIRECTORY}")
-        return Chroma(
-            persist_directory=CHROMA_DB_DIRECTORY,
-            embedding_function=_embeddings_model,
-            collection_name=CHROMA_COLLECTION_NAME
-        )
+    global _chroma_instance
+    if _chroma_instance is None:
+        embeddings = get_embeddings_model()
+        if not os.path.exists(CHROMA_DB_DIRECTORY):
+            logger.info(f"Diretório ChromaDB não encontrado em {CHROMA_DB_DIRECTORY}. Criando...")
+            os.makedirs(CHROMA_DB_DIRECTORY, exist_ok=True)
+            # O ChromaDB será inicializado como vazio e populado na primeira ingestão
+            _chroma_instance = Chroma(
+                persist_directory=CHROMA_DB_DIRECTORY,
+                embedding_function=embeddings,
+                collection_name=CHROMA_COLLECTION_NAME
+            )
+            logger.info(f"Nova instância ChromaDB criada em {CHROMA_DB_DIRECTORY} com coleção '{CHROMA_COLLECTION_NAME}'.")
+        else:
+            logger.info(f"ChromaDB carregado do diretório: {CHROMA_DB_DIRECTORY}")
+            _chroma_instance = Chroma(
+                persist_directory=CHROMA_DB_DIRECTORY,
+                embedding_function=embeddings,
+                collection_name=CHROMA_COLLECTION_NAME
+            )
+    return _chroma_instance
 
 # --- Função Principal de Ingestão Incremental ---
 
@@ -104,7 +106,7 @@ def add_document_to_vector_store(
     file_path: str,
     vector_store: Chroma,
     text_splitter: RecursiveCharacterTextSplitter,
-    detected_metadata: Dict[str, str],
+    detected_metadata: Dict[str, str], # Metadados passados pelo Streamlit (podem ser None)
     max_retries: int = 5
 ):
     """
@@ -115,50 +117,39 @@ def add_document_to_vector_store(
     logger.info(f"Processando arquivo: {file_name} (hash: {get_file_hash(file_path)[:8]})")
 
     try:
-        # Extrair metadados do nome do arquivo
         base_name = os.path.splitext(file_name)[0]
 
-        # --- Processamento de client_name ---
+        # --- Lógica de extração e fallback para metadados ---
+        
+        # client_name
         client_name_from_file = None
         client_match = re.match(r'\[(.*?)\]', base_name)
         if client_match:
-            client_name_from_file = client_match.group(1) # Valor capturado do regex
+            client_name_from_file = client_match.group(1).strip() # Remove espaços em branco
+        client_name_from_detected = detected_metadata.get('client_name')
+        
+        final_client_name = (client_name_from_detected or client_name_from_file or 'UNKNOWN CLIENT').upper()
+        logger.debug(f"[METADATA] Final Client Name para {file_name}: {final_client_name}")
 
-        client_name_from_metadata = detected_metadata.get('client_name') # Pode ser None
-
-        # Prioridade: 1. Do arquivo, 2. Do detected_metadata, 3. Default
-        # Usamos 'or' para pegar o primeiro valor 'truthy' (não-None, não-vazio)
-        final_client_name = (client_name_from_file or 
-                             client_name_from_metadata or 
-                             'UNKNOWN CLIENT')
-        client_name = final_client_name.upper()
-
-        # --- Processamento de doc_type ---
+        # doc_type
         doc_type_from_file = None
         doc_type_match = re.search(r'(MIT\d{3})', base_name, re.IGNORECASE)
         if doc_type_match:
-            doc_type_from_file = doc_type_match.group(1)
+            doc_type_from_file = doc_type_match.group(1).strip()
+        doc_type_from_detected = detected_metadata.get('doc_type')
 
-        doc_type_from_metadata = detected_metadata.get('doc_type')
+        final_doc_type = (doc_type_from_detected or doc_type_from_file or 'UNKNOWN DOC TYPE').upper()
+        logger.debug(f"[METADATA] Final Doc Type para {file_name}: {final_doc_type}")
 
-        final_doc_type = (doc_type_from_file or
-                          doc_type_from_metadata or
-                          'UNKNOWN DOC TYPE')
-        doc_type = final_doc_type.upper()
-        
-        # --- Processamento de project_code ---
+        # project_code
         project_code_from_file = None
         project_code_match = re.search(r'(D\d{9,15})', base_name, re.IGNORECASE)
         if project_code_match:
-            project_code_from_file = project_code_match.group(1)
+            project_code_from_file = project_code_match.group(1).strip()
+        project_code_from_detected = detected_metadata.get('project_code')
 
-        project_code_from_metadata = detected_metadata.get('project_code')
-
-        final_project_code = (project_code_from_file or
-                              project_code_from_metadata or
-                              'UNKNOWN PROJECT')
-        project_code = final_project_code.upper()
-
+        final_project_code = (project_code_from_detected or project_code_from_file or 'UNKNOWN PROJECT').upper()
+        logger.debug(f"[METADATA] Final Project Code para {file_name}: {final_project_code}")
 
         # Hash do documento para verificação de duplicidade
         document_hash = get_file_hash(file_path)
@@ -177,26 +168,39 @@ def add_document_to_vector_store(
             return
 
         pages = loader.load()
-        logger.info(f"Carregados {len(pages)} páginas/seções do documento.")
+        logger.info(f"Carregados {len(pages)} páginas/seções do documento por {type(loader).__name__}.")
 
         # Adicionar metadados adicionais aos documentos antes de chunkar
         for i, page in enumerate(pages):
             page.metadata["source"] = file_name
             page.metadata["document_hash"] = document_hash
             page.metadata["original_filename"] = file_name # Nome original completo do arquivo
-            page.metadata["page_number"] = i + 1 # Adiciona o número da página (começando em 1)
-            page.metadata["client_name"] = client_name
-            page.metadata["doc_type"] = doc_type
-            page.metadata["project_code"] = project_code
+            
+            # Para PDFs, o loader já pode ter um page_number. Mantemos ou adicionamos.
+            # Para DOCX/TXT, adicionamos um 'índice' de página
+            if "page" in page.metadata: # Algumas vezes é 'page' ou 'page_number'
+                page.metadata["page_number"] = page.metadata["page"]
+            elif "page_number" not in page.metadata: 
+                page.metadata["page_number"] = i + 1 # Adiciona o número da página (começando em 1)
+            
+            page.metadata["client_name"] = final_client_name
+            page.metadata["doc_type"] = final_doc_type
+            page.metadata["project_code"] = final_project_code
+
+            logger.debug(f"[METADATA_PAGE] Página {page.metadata.get('page_number', i+1)} de {file_name} com metadados: {page.metadata}")
 
 
         chunks = text_splitter.split_documents(pages)
         # Adicionar um chunk_index a cada chunk para referência
         for i, chunk in enumerate(chunks):
             chunk.metadata["chunk_index"] = i
-            chunk.metadata["client_name"] = client_name # Assegurar metadados no chunk também
-            chunk.metadata["doc_type"] = doc_type
-            chunk.metadata["project_code"] = project_code
+            # Garante que os metadados específicos estejam em CADA CHUNK, mesmo que já estejam nas 'pages'
+            # Isso é redundante mas seguro e garante que o ChromaDB os receba
+            chunk.metadata["client_name"] = final_client_name
+            chunk.metadata["doc_type"] = final_doc_type
+            chunk.metadata["project_code"] = final_project_code
+            logger.debug(f"[METADATA_CHUNK] Chunk {i} de {file_name} com metadados: {chunk.metadata}")
+
 
         logger.info(f"Documento chunkizado em {len(chunks)} partes.")
 
@@ -221,21 +225,16 @@ def add_document_to_vector_store(
                 # Tenta extrair o tempo de reset do erro para uma espera mais precisa
                 reset_time_match = re.search(r'Limit resets at: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC', str(e))
                 if reset_time_match:
-                    reset_time_str = reset_time_match.group(1)
-                    try:
-                        # Parse a string de data/hora para um objeto datetime
-                        reset_dt_utc = datetime.datetime.strptime(reset_time_str, '%Y-%m-%d %H:%M:%S')
-                        current_dt_utc = datetime.datetime.utcnow()
-                        
-                        # Calcula a diferença em segundos, adiciona um buffer e garante que seja positivo
-                        calculated_wait_time = (reset_dt_utc - current_dt_utc).total_seconds() + 5 
-                        if calculated_wait_time > 0:
-                            wait_time = calculated_wait_time
-                            logger.info(f"Aguardando até {reset_time_str} UTC (aproximadamente {wait_time:.0f} segundos) antes de tentar novamente...")
-                        else: # Se o tempo de reset já passou ou é insignificante
-                            logger.info(f"O tempo de reset já passou ou está muito próximo ({calculated_wait_time:.0f}s). Aguardando o tempo padrão de {wait_time} segundos.")
-                    except ValueError:
-                        logger.warning(f"Não foi possível analisar o tempo de reset '{reset_time_str}'. Aguardando o tempo padrão de {wait_time} segundos.")
+                    reset_dt_utc = datetime.datetime.strptime(reset_time_match.group(1), '%Y-%m-%d %H:%M:%S')
+                    current_dt_utc = datetime.datetime.utcnow()
+                    
+                    # Calcula a diferença em segundos, adiciona um buffer e garante que seja positivo
+                    calculated_wait_time = (reset_dt_utc - current_dt_utc).total_seconds() + 5 
+                    if calculated_wait_time > 0:
+                        wait_time = calculated_wait_time
+                        logger.info(f"Aguardando até {reset_dt_utc} UTC (aproximadamente {wait_time:.0f} segundos) antes de tentar novamente...")
+                    else: # Se o tempo de reset já passou ou é insignificante
+                        logger.info(f"O tempo de reset já passou ou está muito próximo ({calculated_wait_time:.0f}s). Aguardando o tempo padrão de {wait_time} segundos.")
                 else: # Se não encontrou a string de reset
                     logger.info(f"Não foi possível encontrar o tempo de reset na mensagem de erro. Aguardando o tempo padrão de {wait_time} segundos.")
                 
@@ -252,67 +251,133 @@ def add_document_to_vector_store(
         logger.error(f"Erro ao processar o arquivo '{file_name}': {e}", exc_info=True)
         raise # Relança a exceção original para a UI
 
-# --- Exemplo de Uso (para teste standalone) ---
+def query_chroma_metadata(client_name: Optional[str] = None, project_code: Optional[str] = None, doc_type: Optional[str] = None):
+    """
+    Consulta o ChromaDB para listar IDs e metadados de documentos, com filtros opcionais.
+    Útil para depuração.
+    """
+    vector_store = get_chroma_instance()
+    
+    where_clause = {}
+    if client_name:
+        where_clause["client_name"] = client_name.upper()
+    if project_code:
+        where_clause["project_code"] = project_code.upper()
+    if doc_type:
+        where_clause["doc_type"] = doc_type.upper()
+
+    logger.info(f"Consultando ChromaDB com filtro: {where_clause if where_clause else 'Nenhum filtro'}")
+    
+    # Se não houver filtro, pegamos um número limitado para não sobrecarregar em bases grandes
+    if not where_clause:
+        results = vector_store._collection.get(limit=100, include=['metadatas'])
+    else:
+        results = vector_store._collection.get(where=where_clause, include=['metadatas'])
+
+    if results and results['ids']:
+        logger.info(f"Encontrados {len(results['ids'])} resultados.")
+        for i, doc_id in enumerate(results['ids']):
+            metadata = results['metadatas'][i]
+            logger.info(f"  ID: {doc_id[:8]}... Metadata: {metadata}")
+    else:
+        logger.info("Nenhum documento encontrado para a consulta.")
+    
+    return results
+
+def get_known_entities() -> Dict[str, List[str]]:
+    """
+    Consulta o ChromaDB para retornar todos os nomes de clientes e códigos de projeto únicos.
+    """
+    vector_store = get_chroma_instance()
+    
+    # Isso é um pouco custoso, mas aceitável para um pequeno número de metadados
+    # Em um cenário de produção com milhões de documentos, talvez buscar de um cache otimizado.
+    try:
+        results = vector_store._collection.get(include=['metadatas'])
+    except Exception as e:
+        logger.error(f"Erro ao obter metadados do ChromaDB: {e}")
+        return {"client_names": [], "project_codes": [], "doc_types": []}
+
+    client_names = set()
+    project_codes = set()
+    doc_types = set()
+
+    if results and results.get('metadatas'):
+        for metadata in results['metadatas']:
+            if 'client_name' in metadata and metadata['client_name']:
+                client_names.add(metadata['client_name'].upper())
+            if 'project_code' in metadata and metadata['project_code']:
+                project_codes.add(metadata['project_code'].upper())
+            if 'doc_type' in metadata and metadata['doc_type']:
+                doc_types.add(metadata['doc_type'].upper())
+
+    logger.debug(f"Entidades Conhecidas - Clientes: {list(client_names)}, Projetos: {list(project_codes)}, Tipos Doc: {list(doc_types)}")
+    return {
+        "client_names": sorted(list(client_names)),
+        "project_codes": sorted(list(project_codes)),
+        "doc_types": sorted(list(doc_types))
+    }
+
+# --- Bloco de Execução Principal (consolidado) ---
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv() # Carrega as variáveis de ambiente
 
     logger.setLevel(logging.DEBUG) # Aumenta o nível de log para debug em teste local
 
-    # Exemplo de configuração do text_splitter
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
-    )
+    # --- Teste de Ingestão de Documentos (Opcional) ---
+    # Descomente o bloco abaixo para realizar a ingestão de documentos de teste
+    #
+    # text_splitter = RecursiveCharacterTextSplitter(
+    #     chunk_size=1000,
+    #     chunk_overlap=200,
+    #     length_function=len,
+    #     is_separator_regex=False,
+    # )
+    # chroma_instance = get_chroma_instance()
+    # sample_docs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'documents'))
+    # files_to_ingest = [
+    #     os.path.join(sample_docs_dir, "[INOVA] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 02-01-2025.docx"),
+    #     os.path.join(sample_docs_dir, "[KION] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041.docx"),
+    #     os.path.join(sample_docs_dir, "[MARSON] Escopo de Customização de Integração - TOTVS iPaaS - MIT041 - V1.0 10-04-2024.docx"),
+    #     os.path.join(sample_docs_dir, "[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx"),
+    #     os.path.join(sample_docs_dir, "Roteiro do Projeto_ TCRM Copilot - Prova de Conceito (PoC).pdf"), # Adicionado o PDF da PoC
+    # ]
+    # for f_path in files_to_ingest:
+    #     if os.path.exists(f_path):
+    #         try:
+    #             metadata_for_ingestion = {} 
+    #             logger.info(f"Iniciando ingestão de {os.path.basename(f_path)}...")
+    #             add_document_to_vector_store(f_path, chroma_instance, text_splitter, metadata_for_ingestion)
+    #             time.sleep(1)
+    #         except Exception as e:
+    #             logger.error(f"Falha ao ingerir {os.path.basename(f_path)}: {e}")
+    #     else:
+    #         logger.warning(f"Arquivo não encontrado: {f_path}")
+    # logger.info("Processo de ingestão incremental concluído.")
 
-    # Obter instância do ChromaDB
-    chroma_instance = get_chroma_instance()
+    # --- Testes de Consulta de Metadados ---
+    logger.setLevel(logging.INFO) # Volta para INFO para os testes de consulta, menos verboso
 
-    # Caminho para o diretório de arquivos de exemplo (ajuste conforme sua estrutura)
-    sample_docs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'documents'))
+    print("\n--- Querying ChromaDB for KION ---")
+    query_chroma_metadata(client_name="KION")
+
+    print("\n--- Querying ChromaDB for SCENS ---")
+    query_chroma_metadata(client_name="SCENS")
     
-    # Lista de arquivos para ingestão
-    files_to_ingest = [
-        os.path.join(sample_docs_dir, "[INOVA] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 02-01-2025.docx"),
-        os.path.join(sample_docs_dir, "[KION] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041.docx"),
-        os.path.join(sample_docs_dir, "[MARSON] Escopo de Customização de Integração - TOTVS iPaaS - MIT041 - V1.0 10-04-2024.docx"),
-        os.path.join(sample_docs_dir, "[Scens] - Escopo Técnico TOTVS CRM Gestão de Clientes - MIT041 V1.0 13-05-2025.docx"),
-        # Adicione outros arquivos de teste aqui
-    ]
+    print("\n--- Querying ChromaDB for INOVA ---")
+    query_chroma_metadata(client_name="INOVA")
+    
+    print("\n--- Querying ChromaDB for MARSON ---")
+    query_chroma_metadata(client_name="MARSON")
 
-    for f_path in files_to_ingest:
-        if os.path.exists(f_path):
-            try:
-                # detected_metadata pode ser extraído dinamicamente ou passado como um dicionário vazio se não for estritamente necessário para o seu caso de uso
-                # Aqui, para exemplo, extraímos do nome do arquivo
-                base_name_f = os.path.splitext(os.path.basename(f_path))[0]
-                client_match_f = re.match(r'\[(.*?)\]', base_name_f)
-                client_name_f = client_match_f.group(1).upper() if client_match_f else 'UNKNOWN CLIENT'
-                doc_type_match_f = re.search(r'(MIT\d{3})', base_name_f, re.IGNORECASE)
-                doc_type_f = doc_type_match_f.group(1).upper() if doc_type_match_f else 'UNKNOWN DOC TYPE'
-                project_code_match_f = re.search(r'(D\d{9,15})', base_name_f, re.IGNORECASE)
-                project_code_f = project_code_match_f.group(1).upper() if project_code_match_f else 'UNKNOWN PROJECT'
-
-                metadata_for_ingestion = {
-                    "client_name": client_name_f,
-                    "doc_type": doc_type_f,
-                    "project_code": project_code_f
-                }
-                
-                add_document_to_vector_store(f_path, chroma_instance, text_splitter, metadata_for_ingestion)
-                time.sleep(1) # Pequena pausa para evitar rate limit em cascata
-            except Exception as e:
-                logger.error(f"Falha ao ingerir {os.path.basename(f_path)}: {e}")
-        else:
-            logger.warning(f"Arquivo não encontrado: {f_path}")
-
-    logger.info("Processo de ingestão incremental concluído.")
-
-    #Para verificar o conteúdo do ChromaDB após a ingestão
-    # if chroma_instance._collection.count() > 0:
-    #     logger.info(f"Total de documentos no ChromaDB: {chroma_instance._collection.count()}")
-    #     # Exemplo de recuperação de um item (pode ser pesado para muitos itens)
-    #     # all_ids = chroma_instance._collection.get(limit=1, include=['metadatas'])
-    #     # logger.debug(f"Exemplo de metadata: {all_ids['metadatas'][0]}")
+    print("\n--- Querying ChromaDB for Documents with MIT041 ---")
+    query_chroma_metadata(doc_type="MIT041")
+    
+    print("\n--- Querying ChromaDB for ALL documents (first 100) ---")
+    query_chroma_metadata() # Sem filtros, pega os primeiros 100
+    
+    # --- Teste de Entidades Conhecidas (Este é o crucial para o copilot_agent) ---
+    print("\n--- Querying ALL known entities ---")
+    known_entities = get_known_entities()
+    print(known_entities)
