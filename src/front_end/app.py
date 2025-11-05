@@ -1,86 +1,174 @@
-# src/front_end/app.py
-
 import sys
 import os
 import re
+import time
+import logging
 
-# Desativa a telemetria do ChromaDB (evita erros de SSL com posthog.com)
+# Desativa a telemetria do ChromaDB (evita erros de SSL com posthog.com em ambientes restritos)
+# Essencial para PoCs e ambientes internos, onde a verificação de certificado pode falhar.
 os.environ['CHROMA_ANALYTICS'] = 'false'
 
 import streamlit as st
-import time
-import logging
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
-# Removido 'StateGraph, END' daqui pois build_graph já importa
-# from langgraph.graph import StateGraph, END
-
-# Configura o logger
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # Mantenha INFO para evitar muita verbosidade da rede
-logger = logging.getLogger(__name__)
 
 # Adiciona a raiz do projeto ao sys.path para que o Python encontre o pacote 'src'
-# independentemente de como o Streamlit é executado.
+# independentemente de como o Streamlit é executado. Garante que as importações internas funcionem.
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root) # Insere no início para dar prioridade
 
-# Carrega as variáveis do .env no início do script
+# Carrega as variáveis do .env no início do script, garantindo que estejam disponíveis globalmente.
 load_dotenv()
 
-# --- VERIFICAÇÃO DE AMBIENTE: ADICIONADO PARA DEBUG ---
+# --- Configuração de Logging ---
+# Configura o logger para toda a aplicação. Nível INFO é um bom balanço entre verbosidade e informação.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- VERIFICAÇÃO CRÍTICA DE AMBIENTE ---
+# Valida a presença da chave da API da OpenAI, crucial para o funcionamento do LLM.
 openai_api_key_status = os.getenv("OPENAI_API_KEY")
 if openai_api_key_status:
     logger.info("OPENAI_API_KEY foi carregada com sucesso (valor não exibido por segurança).")
 else:
-    logger.error("FALHA: OPENAI_API_KEY NÃO FOI CARREGADA. Verifique seu arquivo .env e seu posicionamento.")
+    logger.error("FALHA CRÍTICA: OPENAI_API_KEY NÃO FOI CARREGADA. Verifique seu arquivo .env e seu posicionamento.")
     st.error("Aviso: OPENAI_API_KEY não foi carregada. Verifique o console para mais detalhes.")
-# --- FIM VERIFICAÇÃO DE AMBIENTE ---
+    # Considerar st.stop() aqui se o funcionamento do LLM for mandatório e não puder prosseguir
+    # st.stop() # Descomentar para interromper a execução do Streamlit se a chave não estiver presente.
 
-# --- Importar as definições do agente que criamos ---
-# Agora importamos a função build_graph diretamente, que já tem o grafo completo
-from src.core.copilot_agent import AgentState, build_graph # <--- IMPORTAÇÃO CORRIGIDA!
+# --- Importações do Core do Copilot e Ingestão ---
+# Importa o estado do agente e a função de construção do grafo principal.
+from src.core.copilot_agent import AgentState, build_graph
+# Importa funções para ingestão incremental de documentos e acesso ao ChromaDB.
 from src.data_ingestion.incremental_ingestor import add_document_to_vector_store, get_chroma_instance, get_embeddings_model
-from langchain.text_splitter import RecursiveCharacterTextSplitter # Importar text_splitter para inicialização
+# Importa o text splitter, necessário para o processamento de documentos.
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
-# --- Configuração do Agente LangGraph ---
-# REMOVIDA A FUNÇÃO create_agent_workflow() DAQUI, POIS USAMOS build_graph() DO copilot_agent.py
+# --- Funções Auxiliares para o Streamlit UI ---
 
-# Inicializa o agente e componentes na primeira execução do Streamlit
-if "copilot_agent" not in st.session_state:
+def initialize_copilot_components():
+    """
+    Inicializa o agente LangGraph e a base de vetores (ChromaDB) na sessão do Streamlit.
+    Garante que estes componentes sejam configurados apenas uma vez.
+    """
+    if "copilot_agent" not in st.session_state:
+        try:
+            st.session_state.copilot_agent = build_graph()
+            st.session_state.llm_initialized = True
+            logger.info("Copilot Agent inicializado com sucesso.")
+        except Exception as e:
+            logger.error(f"Erro ao inicializar o Copilot Agent: {e}. Verifique as variáveis de ambiente e a base de conhecimento.", exc_info=True)
+            st.error(f"Erro ao inicializar o Copilot: {e}. Certifique-se de que a base de conhecimento foi construída e as variáveis de ambiente estão corretas.")
+            st.session_state.llm_initialized = False
+
+    if "text_splitter" not in st.session_state:
+        st.session_state.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            is_separator_regex=False,
+        )
+
+    if "vector_store" not in st.session_state:
+        try:
+            st.session_state.vector_store = get_chroma_instance()
+            logger.info("ChromaDB instance loaded.")
+        except Exception as e:
+            logger.error(f"Erro ao carregar instância do ChromaDB: {e}", exc_info=True)
+            st.error(f"Erro ao carregar base de vetores: {e}")
+
+    # Garante que llm_initialized seja sempre definido, mesmo que a inicialização falhe.
+    if "llm_initialized" not in st.session_state:
+        st.session_state.llm_initialized = False # Default para False se não for setado.
+
+def handle_document_upload(uploaded_file, client_name, doc_type, project_code):
+    """
+    Processa o upload de um documento, salvando-o temporariamente e adicionando-o à base de vetores.
+    Fornece feedback ao usuário via Streamlit.
+    """
+    if uploaded_file is None:
+        st.warning("Por favor, selecione um arquivo para fazer o upload.")
+        st.toast("Nenhum arquivo selecionado!", icon="⚠️")
+        return
+
+    st.info("Processando documento para adicionar à base de conhecimento...")
+    temp_file_path = None # Inicializa para garantir que esteja acessível no finally
     try:
-        st.session_state.copilot_agent = build_graph() # <--- AGORA CHAMAMOS build_graph() CORRETAMENTE!
-        st.session_state.llm_initialized = True
-        logger.info("Copilot Agent inicializado com sucesso.")
+        # Salva o arquivo temporariamente para processamento.
+        temp_dir = "temp_uploads"
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+        with open(temp_file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        # Prepara os metadados para a ingestão.
+        metadata_for_ingestion = {
+            "client_name": client_name if client_name else None,
+            "doc_type": doc_type if doc_type else None,
+            "project_code": project_code if project_code else None
+        }
+        
+        # Adiciona o documento à base de vetores.
+        add_document_to_vector_store(
+            file_path=temp_file_path,
+            vector_store=st.session_state.vector_store,
+            text_splitter=st.session_state.text_splitter,
+            detected_metadata=metadata_for_ingestion
+        )
+        st.success(f"Documento '{uploaded_file.name}' adicionado com sucesso!")
+        st.toast("Upload e ingestão concluídos!", icon="✅")
+
     except Exception as e:
-        logger.error(f"Erro ao inicializar o Copilot Agent: {e}. Verifique as variáveis de ambiente e a base de conhecimento.", exc_info=True)
-        st.error(f"Erro ao inicializar o Copilot: {e}. Certifique-se de que a base de conhecimento foi construída e as variáveis de ambiente estão corretas.")
-        st.session_state.llm_initialized = False
+        logger.error(f"Erro inesperado ao adicionar documento: {e}", exc_info=True)
+        st.error(f"Erro inesperado ao adicionar documento: {e}")
+        st.toast("Erro no upload ou ingestão!", icon="🚨")
+    finally:
+        # Garante que o arquivo temporário seja removido mesmo em caso de erro.
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            logger.info(f"Arquivo temporário {temp_file_path} removido.")
 
-# Inicializa o text_splitter e a instância do ChromaDB
-if "text_splitter" not in st.session_state:
-    st.session_state.text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
-    )
+def convert_st_messages_to_lc_messages(st_messages):
+    """
+    Converte o histórico de mensagens do formato Streamlit para o formato LangChain.
+    """
+    lc_messages = []
+    for msg in st_messages:
+        if msg["role"] == "user":
+            lc_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            lc_messages.append(AIMessage(content=msg["content"]))
+    return lc_messages
 
-if "vector_store" not in st.session_state:
-    try:
-        st.session_state.vector_store = get_chroma_instance()
-        logger.info("ChromaDB instance loaded.")
-    except Exception as e:
-        logger.error(f"Erro ao carregar instância do ChromaDB: {e}", exc_info=True)
-        st.error(f"Erro ao carregar base de vetores: {e}")
+def display_typing_simulation(message_placeholder, full_response):
+    """
+    Simula o efeito de digitação para a resposta do assistente no Streamlit.
+    """
+    accumulated_text = ""
+    # Simulação básica: exibe a resposta palavra por palavra.
+    # Pode ser ajustado para caracteres ou para simular um tempo de resposta mais natural.
+    for chunk in full_response.split(" "):
+        accumulated_text += chunk + " "
+        time.sleep(0.02) # Ajuste a velocidade de digitação aqui (menor = mais rápido)
+        message_placeholder.markdown(accumulated_text + "▌") # Adiciona um cursor piscando
 
-# --- TCRM Copilot Streamlit UI ---
-st.set_page_config(page_title="TCRM Copilot", page_icon="🤖")
+    message_placeholder.markdown(full_response) # Exibe a resposta completa e final.
+
+
+# --- Configuração da Página do Streamlit ---
+st.set_page_config(page_title="TCRM Copilot", page_icon="🤖", layout="centered")
 
 st.title("🤖 TCRM Copilot")
 st.markdown("Seu assistente de IA para projetos TOTVS CRM.")
 
+
+# --- Inicialização dos Componentes do Copilot (Agente e DB) ---
+initialize_copilot_components()
+
+
+# --- Sidebar para Gerenciamento da Base de Conhecimento ---
 with st.sidebar:
     st.header("⚙️ Gerenciamento da Base de Conhecimento")
     st.subheader("Upload de Novo Documento")
@@ -91,134 +179,85 @@ with st.sidebar:
         help="Faça o upload de um novo documento para adicioná-lo à base de conhecimento do Copilot."
     )
 
-    # Campos para metadados adicionais
     client_name_for_upload = st.text_input(
         "Nome do Cliente (Opcional)",
-        key="upload_client_name", # Adicionado key para evitar problemas de re-render
-        help="Ex: KION, MARSON, SCENS. Use para filtrar em futuras consultas. Deixe em branco se não aplicável."
+        key="upload_client_name",
+        help="Ex: KION, MARSON, SCENS. Use para filtrar em futuras consultas."
     )
     doc_type_for_upload = st.text_input(
         "Tipo de Documento (Opcional)",
-        key="upload_doc_type", # Adicionado key
-        help="Ex: Escopo Técnico, Ordem de Serviço. Ajuda a categorizar o documento."
+        key="upload_doc_type",
+        help="Ex: Escopo Técnico, Ordem de Serviço, Roteiro. Ajuda a categorizar o documento."
     )
     project_code_for_upload = st.text_input(
         "Código do Projeto (Opcional)",
-        key="upload_project_code", # Adicionado key
+        key="upload_project_code",
         help="Ex: D000071597001. Para vincular a um projeto específico."
     )
 
-    if st.button("Adicionar Documento à Base"):
-        if uploaded_file is not None:
-            st.info("Processando documento para adicionar à base de conhecimento...")
-            try:
-                # Salvar o arquivo temporariamente para que o loader possa acessá-lo
-                temp_file_path = os.path.join("temp", uploaded_file.name)
-                os.makedirs("temp", exist_ok=True)
-                with open(temp_file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+    if st.button("Adicionar Documento à Base", help="Clique para processar e adicionar o arquivo selecionado à base de conhecimento."):
+        handle_document_upload(uploaded_file, client_name_for_upload, doc_type_for_upload, project_code_for_upload)
 
-                # Construir o dicionário detected_metadata
-                metadata_for_ingestion = {
-                    "client_name": client_name_for_upload if client_name_for_upload else None,
-                    "doc_type": doc_type_for_upload if doc_type_for_upload else None,
-                    "project_code": project_code_for_upload if project_code_for_upload else None
-                }
-                
-                # Chamar a função de ingestão com o caminho do arquivo temporário e os metadados
-                add_document_to_vector_store(
-                    file_path=temp_file_path,
-                    vector_store=st.session_state.vector_store,
-                    text_splitter=st.session_state.text_splitter,
-                    detected_metadata=metadata_for_ingestion
-                )
-                st.success(f"Documento '{uploaded_file.name}' adicionado com sucesso!")
-                st.toast("Upload concluído!", icon="✅")
-                
-                # Opcional: remover o arquivo temporário após o processamento
-                os.remove(temp_file_path)
-                logger.info(f"Arquivo temporário {temp_file_path} removido.")
 
-            except Exception as e:
-                logger.error(f"Erro inesperado ao adicionar documento: {e}", exc_info=True)
-                st.error(f"Erro inesperado ao adicionar documento: {e}")
-                st.toast("Erro no upload!", icon="🚨")
-        else:
-            st.warning("Por favor, selecione um arquivo para fazer o upload.")
-            st.toast("Nenhum arquivo selecionado!", icon="⚠️")
+# --- Seção Principal do Chat ---
 
-# Inicializar histórico de chat na sessão do Streamlit
+# Inicializa o histórico de chat na sessão do Streamlit se ainda não existir.
 if "messages" not in st.session_state:
     st.session_state.messages = []
-# Ensure llm_initialized is set even if not initially found, to prevent KeyError
-if "llm_initialized" not in st.session_state:
-    st.session_state.llm_initialized = False # Default to False if not set by try/except
 
-
-# Display de mensagens anteriores
+# Exibe mensagens anteriores do histórico.
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Entrada de chat
+# Processa a entrada do usuário no chat.
 if prompt := st.chat_input("Pergunte ao Copilot sobre seu projeto..."):
+    # Verifica se o LLM foi inicializado com sucesso antes de processar a pergunta.
     if not st.session_state.llm_initialized:
-        st.warning("O Copilot não foi inicializado corretamente. Verifique os logs.")
-        st.stop()
+        st.warning("O Copilot não foi inicializado corretamente. Verifique os logs de inicialização.")
+        st.stop() # Interrompe a execução para evitar erros.
 
+    # Adiciona a pergunta do usuário ao histórico.
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Prepara para exibir a resposta do assistente.
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
-        
-        # Variável para acumular a simulação de digitação
-        accumulated_text_for_display = ""
-        # Variável para guardar a resposta FINAL do agente
-        agent_final_response_content = ""
+        agent_final_response_content = "" # Variável para armazenar a resposta final do agente.
 
         try:
-            # --- CONVERSÃO DAS MENSAGENS E ESTADO INICIAL COMPLETO ---
-            lc_messages = []
-            for msg in st.session_state.messages:
-                if msg["role"] == "user":
-                    lc_messages.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    lc_messages.append(AIMessage(content=msg["content"]))
+            # Converte o histórico de mensagens para o formato do LangChain.
+            lc_messages = convert_st_messages_to_lc_messages(st.session_state.messages)
 
-            # --- REMOVIDA A EXTRAÇÃO DE METADADOS DA PERGUNTA DO USUÁRIO AQUI ---
-            # Essa extração agora é feita pelo 'extract_filters_node' no grafo.
-            
+            # Prepara o estado inicial do agente com a pergunta e o histórico.
             initial_agent_state = AgentState(
                 question=prompt,
-                context=[],         # Será populado por retrieve_context_node
-                source_docs=[],     # Será populado por retrieve_context_node
-                answer="",          # Será populado por generate_response_node
-                messages=lc_messages, # Mensagens convertidas para o formato LangChain
-                filters={} # <--- FILTROS INICIALIZADOS VAZIOS. extract_filters_node irá populá-los.
+                context=[],         # Populado pelo nó 'retrieve_context_node'.
+                source_docs=[],     # Populado pelo nó 'retrieve_context_node'.
+                answer="",          # Populado pelo nó 'generate_response_node'.
+                messages=lc_messages, # Histórico de mensagens para contexto do LLM.
+                filters={}          # Populado pelo nó 'extract_filters_node'.
             )
 
-            # Invocar o agente LangGraph
+            # Invoca o agente LangGraph para processar a pergunta.
             response = st.session_state.copilot_agent.invoke(initial_agent_state)
             
-            # A resposta final formatada já deve estar em response['answer']
-            agent_final_response_content = response.get("answer", "Não consegui gerar uma resposta para isso. Tente refazer a pergunta ou fornecer mais contexto.")
+            # Extrai a resposta final do resultado do agente.
+            agent_final_response_content = response.get(
+                "answer",
+                "Não consegui gerar uma resposta detalhada para isso. Tente reformular a pergunta ou fornecer mais contexto."
+            )
 
-            # Simular digitação usando a variável temporária
-            for chunk in agent_final_response_content.split(" "):
-                accumulated_text_for_display += chunk + " "
-                time.sleep(0.05)
-                message_placeholder.markdown(accumulated_text_for_display + "▌")
-            
-            # Exiba a resposta COMPLETA e FINAL (sem o cursor piscando)
-            message_placeholder.markdown(agent_final_response_content)
+            # Exibe a resposta com simulação de digitação.
+            display_typing_simulation(message_placeholder, agent_final_response_content)
 
         except Exception as e:
             logger.error(f"Ocorreu um erro ao processar sua pergunta: {e}", exc_info=True)
             st.error(f"Ocorreu um erro ao processar sua pergunta: {e}")
-            agent_final_response_content = "Ops! Parece que algo deu errado. Por favor, tente novamente."
-            message_placeholder.markdown(agent_final_response_content) # Exibe a mensagem de erro
+            agent_final_response_content = "Ops! Parece que algo deu errado ao processar sua pergunta. Por favor, tente novamente."
+            message_placeholder.markdown(agent_final_response_content) # Exibe a mensagem de erro no Streamlit.
 
-    # Apenas UMA VEZ, adicione a resposta final (limpa e completa) ao histórico da sessão
+    # Adiciona a resposta final do assistente ao histórico da sessão.
     st.session_state.messages.append({"role": "assistant", "content": agent_final_response_content})
