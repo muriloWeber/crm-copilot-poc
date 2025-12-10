@@ -28,6 +28,7 @@ import re
 import sys
 import glob
 import logging
+from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import chardet
 from langchain.text_splitter import RecursiveCharacterTextSplitter

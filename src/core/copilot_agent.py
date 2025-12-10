@@ -15,8 +15,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain import hub # Mantido caso precise puxar prompts do LangChain Hub
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 import httpx # Necessário para configurar o cliente HTTP com verificação SSL
 import operator # Usado para a anotação Annotated[List[BaseMessage], operator.add]
 from langgraph.graph import StateGraph, END # Componentes essenciais do LangGraph

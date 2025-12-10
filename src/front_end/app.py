@@ -43,7 +43,7 @@ from src.core.copilot_agent import AgentState, build_graph
 # Importa funções para ingestão incremental de documentos e acesso ao ChromaDB.
 from src.data_ingestion.incremental_ingestor import add_document_to_vector_store, get_chroma_instance, get_embeddings_model
 # Importa o text splitter, necessário para o processamento de documentos.
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 # --- Funções Auxiliares para o Streamlit UI ---
